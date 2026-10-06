@@ -14,7 +14,7 @@
 | `run_bot.sh` / `run_bot.ps1` | 봇 포그라운드 실행. `.venv`의 파이썬(`.sh`는 `.venv/bin/python`, `.ps1`은 `.venv\Scripts\python.exe`)으로 `python -m src.main`. `.venv`가 없으면 `scripts/setup`을 안내하며 중단 |
 | `check_claude.sh` / `check_claude.ps1` | Claude CLI 연결 진단. `--version` 후 `-p "ping"`으로 왕복 확인. 둘 다 `.env`를 직접 파싱해 `CLAUDE_BIN`을 존중하고, 없으면 PATH에서 찾는다 |
 | `launchd_load.sh` | macOS LaunchAgent 등록. 인라인 파이썬으로 plist를 만들어 `~/Library/LaunchAgents/`에 쓰고 `launchctl load`. `RunAtLoad` + `KeepAlive`로 상시 구동 |
-| `register_scheduled_task.ps1` | Windows 작업 스케줄러 등록. 로그온 시 기동, 3회 재시작, 로그는 `%LOCALAPPDATA%\discord-claude-assistant\logs\bot.log` |
+| `register_scheduled_task.ps1` | Windows 작업 스케줄러 등록. 로그온 시 기동, 3회 재시작, 로그는 `%LOCALAPPDATA%\slack-claude-assistant\logs\bot.log` |
 | `unregister_scheduled_task.ps1` | 위 작업 해제 |
 
 ## Subdirectories

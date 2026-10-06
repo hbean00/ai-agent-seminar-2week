@@ -1,16 +1,43 @@
-# 디스코드로 부르는 클로드코드, claudecord
+# 슬랙으로 부르는 클로드코드, claudecord-slack
 
 [![이미지](./logo.png)]() 
 
-## 디스코드 앱으로 명령하는 모습
+## 메신저로 명령하는 모습
 ![샘플](example.jpeg)
 
+> 위 스크린샷은 포크 원본의 Discord 화면입니다. 이 저장소는 같은 흐름을 Slack에서 수행합니다.
+
 > **PC 앞을 떠나도 멈추지 않는 AI 비서**
-> 모바일에서 Discord 메시지 한 통이면, 집에 있는 내 PC의 Claude Code가 깨어나 일을 시작합니다.
+> 모바일에서 Slack 메시지 한 통이면, 집에 있는 내 PC의 Claude Code가 깨어나 일을 시작합니다.
 
 [![Python](https://img.shields.io/badge/Python-3.11+-blue.svg)]()
 [![Claude Code](https://img.shields.io/badge/Powered%20by-Claude%20Code-D97757)]()
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](./LICENSE)
+
+---
+
+## 📌 이 저장소에 대하여
+
+이 프로젝트는 **[wnghdcjfe/claudecord](https://github.com/wnghdcjfe/claudecord)** 를 포크해
+**Discord 대신 Slack에서 동작하도록 개조한 버전**입니다. 원본의 설계와 코드 대부분이 그대로이며,
+메신저 연동 계층을 교체하고 반복 예약 기능을 더했습니다.
+
+- **원본**: [wnghdcjfe/claudecord](https://github.com/wnghdcjfe/claudecord) — MIT License, Copyright (c) 2026 wnghdcjfe
+- **라이선스**: 원본과 동일한 MIT. `LICENSE` 파일의 원 저작권 고지를 그대로 유지합니다.
+- **로고와 스크린샷**: 원본 프로젝트의 것을 그대로 사용했습니다.
+- **목적**: 세미나 발표용 / 비영리
+
+### 원본에서 바뀐 점
+
+| 영역 | 원본 | 이 포크 |
+|---|---|---|
+| 메신저 | Discord Gateway (`discord.py`) | Slack Socket Mode (`slack-bolt`) |
+| 메시지 그룹화 | 채널에 나열 | 요청 메시지의 **스레드**로 묶임 |
+| 반복 예약 | 없음 | "매일 아침 7시에 ~해줘" 자연어 등록 |
+| 인증 ID | 정수 Discord ID | `U`/`C` 접두사 Slack ID |
+
+전환은 `src/chat.py` 한 모듈이 떠맡습니다. Claude CLI 실행·웜 프로세스 풀·잡 디렉터리·세션 관리
+등 핵심 로직(약 3,000줄)은 원본 그대로이며 메신저를 전혀 모릅니다.
 
 ---
 
@@ -31,11 +58,12 @@
 
 ## 🎯 주요 기능
 
-- 📱 **모바일에서 PC 제어**: Discord 메시지로 Claude Code 작업 지시
+- 📱 **모바일에서 PC 제어**: Slack 메시지로 Claude Code 작업 지시
 - 🔒 **화이트리스트 인증**: 등록된 사용자 ID와 채널 ID에서만 동작
 - 📦 **작업 격리**: 모든 작업은 `runs/job-xxxx/` 디렉터리에 분리 실행
-- 📎 **결과물 자동 첨부**: CLI가 생성한 파일을 Discord로 즉시 전송
-- 🛑 **원격 세션 종료**: Discord에서 `종료`를 보내 실행 중인 Claude Code 프로세스와 저장된 대화 세션을 한 번에 정리
+- 📎 **결과물 자동 첨부**: CLI가 생성한 파일을 Slack으로 즉시 전송
+- 🛑 **원격 세션 종료**: Slack에서 `종료`를 보내 실행 중인 Claude Code 프로세스와 저장된 대화 세션을 한 번에 정리
+- ⏰ **반복 예약**: "매일 아침 7시에 ~해줘"처럼 평소 말투로 등록하면 그 시각마다 자동 실행
 - 💸 **추가 비용 0원**: Claude Pro/Max 구독 한도 안에서 동작, API 키 불필요
 
 ---
@@ -43,10 +71,10 @@
 ## 🏗️ 작동 방식
 
 ```
-[모바일/PC Discord]
+[모바일/PC Slack]
         │
         ▼ 메시지
-[Discord Gateway]  ◄── outbound WebSocket ──┐
+[Slack Socket Mode] ◄── outbound WebSocket ──┐
                                             │
                                     [내 PC의 claudecord 봇]
                                             │
@@ -58,10 +86,12 @@
                                     파일 생성/수정
                                             │
                                             ▼
-                                    [Discord 채널에 결과 첨부]
+                                    [Slack 스레드에 결과 첨부]
 ```
 
-봇은 **클라우드가 아닌 내 PC 안에서 돌아갑니다**. Discord Gateway는 봇 쪽에서 outbound WebSocket으로 연결하는 구조라, 별도 호스팅 없이 PC에서 직접 띄울 수 있습니다.
+봇은 **클라우드가 아닌 내 PC 안에서 돌아갑니다**. Slack Socket Mode는 봇 쪽에서 outbound WebSocket으로 연결하는 구조라, 별도 호스팅 없이 PC에서 직접 띄울 수 있습니다.
+
+잡 하나가 만드는 모든 메시지(접수 확인, 진행 상태, 결과 첨부)는 **요청한 메시지의 스레드 안**에 모입니다.
 
 ---
 
@@ -71,52 +101,77 @@
 
 - Python 3.11 이상
 - Claude Code CLI 설치 및 로그인 완료
-- Discord 계정
+- Slack 워크스페이스 (앱을 설치할 권한이 있어야 합니다)
 
-### 1. Discord 봇 만들기
+### 1. Slack 앱 만들기
 
-1. [Discord Developer Portal](https://discord.com/developers/applications) 접속
-2. **New Application** → 이름 입력 (예: `claudecord`)
-3. 좌측 **Bot** 탭 → **Reset Token** → 토큰 복사 후 안전한 곳에 저장
-4. **MESSAGE CONTENT INTENT** 토글 **ON**
+1. [Slack API: Your Apps](https://api.slack.com/apps) 접속
+2. **Create New App** → **From scratch** → 이름 입력 (예: `claudecord`) 후 워크스페이스 선택
 
-### 2. 봇 권한 설정
+### 2. Socket Mode 켜기
 
-**OAuth2 → URL Generator** 에서 다음을 체크:
+좌측 **Socket Mode** → **Enable Socket Mode** 토글 **ON**.
 
-**Scopes**
-- `bot`
-- `applications.commands`
+토글을 켜면 앱 토큰을 만들라고 안내합니다. 이름은 아무거나 좋고 스코프는
+`connections:write`입니다. 발급된 **`xapp-`로 시작하는 토큰**을 복사해 두세요.
+(이미 켠 뒤라면 **Basic Information → App-Level Tokens** 에서 다시 만들 수 있습니다.)
 
-**Bot Permissions**
+> Socket Mode가 이 프로젝트의 전제입니다. 봇이 Slack 쪽으로 웹소켓을 여는 구조라,
+> 공개 HTTPS 주소 없이 집 PC에서 그대로 돌릴 수 있습니다. 끄면 Slack이 내 PC로
+> 들어와야 하므로 별도 호스팅이나 터널링이 필요해집니다.
 
-| 카테고리 | 권한 |
+### 3. 권한 설정
+
+**OAuth & Permissions → Scopes → Bot Token Scopes** 에 다음을 추가:
+
+| 스코프 | 용도 |
 |---|---|
-| 일반 | 채널 관리, 채널 보기 |
-| 채팅 | 메시지 보내기, 메시지 관리, 링크 임베드, 파일 첨부, 메시지 기록 보기, 빗금 명령어 사용 |
+| `chat:write` | 응답 전송 및 진행 상태 메시지 수정 |
+| `files:write` | 결과물 파일 업로드 |
+| `channels:history` | 공개 채널에서 보낸 메시지 수신 |
+| `groups:history` | 비공개 채널에서 쓸 경우 |
+| `im:history` | DM으로 쓸 경우 |
 
-생성된 URL을 브라우저에 붙여넣고 본인 서버에 봇을 초대합니다.
+### 4. 이벤트 구독
 
-### 3. ID 확보
+**Event Subscriptions** → **Enable Events** 토글 **ON** →
+**Subscribe to bot events** 에 쓰려는 곳에 맞춰 추가:
 
-Discord 설정에서 **개발자 모드**를 켠 뒤:
+- `message.channels` (공개 채널)
+- `message.groups` (비공개 채널)
+- `message.im` (DM)
 
-- **본인 프로필 우클릭 → 사용자 ID 복사**
-- **봇 전용 채널 우클릭 → 채널 ID 복사**
+### 5. 워크스페이스에 설치
 
-### 4. 환경 변수 설정
+**OAuth & Permissions → Install to Workspace**. 설치하면
+**`xoxb-`로 시작하는 Bot User OAuth Token**이 나옵니다. 복사해 두세요.
+
+마지막으로 봇을 쓸 채널에서 `/invite @claudecord` 로 초대합니다. 초대하지 않으면
+메시지 이벤트가 오지 않습니다.
+
+### 6. ID 확보
+
+- **멤버 ID**: 본인 프로필 → **더보기(⋯)** → **멤버 ID 복사** (`U`로 시작)
+- **채널 ID**: 채널 이름 클릭 → 세부정보 창 맨 아래 (`C`로 시작)
+
+채널 **이름**(`#general`)이 아니라 **ID**입니다.
+
+### 7. 환경 변수 설정
 
 프로젝트 루트에 `.env` 파일 생성:
 
 ```bash
-# Discord 봇 토큰 (절대 외부 노출 금지)
-DISCORD_BOT_TOKEN=your_bot_token_here
+# Slack 봇 토큰 — Web API 호출용 (절대 외부 노출 금지)
+SLACK_BOT_TOKEN=xoxb-your-bot-token
 
-# 봇을 사용할 본인 Discord 계정 ID (쉼표로 여러 개 등록 가능, 부계정 등)
-OWNER_DISCORD_ID=123456789012345678
+# Slack 앱 토큰 — Socket Mode 웹소켓용. 봇 토큰과 역할이 다릅니다
+SLACK_APP_TOKEN=xapp-your-app-token
+
+# 봇을 사용할 본인 Slack 멤버 ID (쉼표로 여러 개 등록 가능, 부계정 등)
+OWNER_SLACK_ID=U01ABCDEFGH
 
 # 봇이 응답할 채널 ID (쉼표로 여러 개 등록 가능)
-ALLOWED_CHANNEL_IDS=987654321098765432
+ALLOWED_CHANNEL_IDS=C01ABCDEFGH
 ```
 
 `.env.example`을 복사해 시작하는 것을 권장합니다 (`cp .env.example .env`).
@@ -141,7 +196,7 @@ ALLOWED_CHANNEL_IDS=987654321098765432
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `CLAUDE_MODEL` | `sonnet` | Claude CLI에 넘길 모델. 디스코드 요청 대부분은 sonnet으로 충분하고 가장 빠릅니다. 복잡한 작업 위주라면 `opus`로 올리세요. |
+| `CLAUDE_MODEL` | `sonnet` | Claude CLI에 넘길 모델. 슬랙 요청 대부분은 sonnet으로 충분하고 가장 빠릅니다. 복잡한 작업 위주라면 `opus`로 올리세요. |
 | `CLAUDE_STREAM_LIMIT_BYTES` | `8388608` (8MiB) | stream-json 한 줄의 최대 바이트. 아주 큰 파일을 Write할 때 스트림이 끊기면 늘리세요. |
 | `WORKING_GIF` | 꺼짐 | `1`/`true`로 켜면 "작업중" GIF를 첨부합니다. 켜면 첫 응답이 GIF 업로드 시간만큼 늦어집니다. |
 | `SESSION_TTL_SECONDS` | `3600` | 채널별 대화 세션 유지 시간(초). 길수록 대화 문맥이 누적되어 턴당 응답이 조금씩 느려집니다. 짧게 잡으면 대화가 자주 초기화되는 대신 빨라집니다. |
@@ -156,7 +211,7 @@ ALLOWED_CHANNEL_IDS=987654321098765432
 | `WARM_CLAUDE_IDLE_TTL_SECONDS` | `300` | 재사용 대기 중인 프로세스를 정리하기까지의 유휴 시간(초). |
 | `WARM_CLAUDE_MAX_PROCESSES` | `2` | 동시에 살려둘 유휴 프로세스 상한. 초과하면 오래된 것부터 정리합니다. `0`이면 재사용하지 않습니다. |
 
-디스코드에서 `종료`를 보내면 실행 중인 프로세스와 함께 재사용 대기 중인 프로세스도 전부 정리됩니다.
+슬랙에서 `종료`를 보내면 실행 중인 프로세스와 함께 재사용 대기 중인 프로세스도 전부 정리됩니다.
 
 ##### 잡 상한
 
@@ -171,7 +226,7 @@ ALLOWED_CHANNEL_IDS=987654321098765432
 
 | 변수 | 기본값 | 설명 |
 |---|---|---|
-| `OUTPUT_INLINE_MAX_CHUNKS` | `3` | 답변이 이 조각 수를 넘으면 여러 건으로 쪼개 보내는 대신 `response.md` 첨부 1건으로 전환합니다. 채널당 5건/5초 제한에 걸려 마지막 조각이 늦게 도착하는 걸 막습니다. |
+| `OUTPUT_INLINE_MAX_CHUNKS` | `3` | 답변이 이 조각 수를 넘으면 여러 건으로 쪼개 보내는 대신 `response.md` 첨부 1건으로 전환합니다. 채널당 초당 1건 수준인 Slack 게시 한도에 걸려 마지막 조각이 늦게 도착하는 걸 막습니다. |
 | `LOG_LEVEL` | `INFO` | 로그 레벨(`DEBUG`/`INFO`/`WARNING`/`ERROR`). 상시 구동 중 문제를 추적할 때 `DEBUG`로 낮추세요. |
 | `DEBUG_TIMING` | 꺼짐 | `1`/`true`면 최종 응답 끝에 구간별 소요 시간을 한 줄 덧붙입니다. 구간 기록 자체는 항상 `<job_dir>/timings.json`에 남습니다. |
 
@@ -198,13 +253,53 @@ scripts\run_bot.ps1       # .venv 파이썬으로 실행
 
 봇이 온라인 상태로 바뀌면 준비 완료입니다.
 
+### ⏰ 반복 예약
+
+평소 말투로 등록합니다.
+
+```
+매일 아침 7시에 어제 커밋 요약해서 알려줘
+매주 월요일 9시에 이번 주 할 일 정리해줘
+평일 저녁 7시에 오늘 바뀐 파일 목록 보여줘
+```
+
+봇이 시각을 해석해서 되돌려 확인해 줍니다:
+
+```
+예약 등록 완료 · `a1b2c3d4`
+매일 07:00에 실행합니다 (다음: 03월 03일 07:00)
+내용: 어제 커밋 요약해서 알려줘
+```
+
+| 명령 | 동작 |
+|---|---|
+| `예약 목록` | 이 채널에 등록된 예약과 각각의 id |
+| `예약 삭제 <id>` | 해당 예약 해제 (`예약 취소`, `예약 해제`도 동일) |
+
+예약 작업의 결과는 **하나의 스레드**로 묶여서 올라옵니다.
+
+> ⚠️ **봇이 떠 있어야 실행됩니다.** 예약은 OS 작업 스케줄러가 아니라 봇 프로세스 안에서
+> 돌기 때문에, PC가 꺼져 있거나 절전 상태면 그 시각에 아무 일도 일어나지 않습니다.
+>
+> 대신 **놓친 작업은 깨어날 때 따라잡습니다.** 07:00 예약인데 PC가 09:40에 깨어났다면
+> 그때 실행하고 "예정 07:00, PC가 꺼져 있어 지금 실행합니다"라고 알려줍니다. 하루에
+> 한 번만 실행되므로 봇을 여러 번 재시작해도 중복되지 않습니다.
+>
+> 아침에 확실히 받으려면 절전을 끄는 쪽이 안전합니다 — 전원 연결 상태에서
+> `powercfg -change standby-timeout-ac 0`.
+
+#### 매달·매년은 아직 지원하지 않습니다
+
+일(daily)과 주(weekly) 단위만 해석합니다. "매달 1일에"는 예약으로 등록되지 않고
+일반 작업으로 실행됩니다.
+
 #### 상시 구동 (선택)
 
 터미널을 켜 두지 않고 PC 부팅/로그인 시 자동으로 봇을 띄우려면:
 
 | 플랫폼 | 등록 | 해제 |
 |---|---|---|
-| macOS | `scripts/launchd_load.sh` — LaunchAgent 등록 (`RunAtLoad` + `KeepAlive`로 상시 구동, 죽으면 자동 재시작) | `launchctl unload ~/Library/LaunchAgents/com.discord-claude-assistant.plist` |
+| macOS | `scripts/launchd_load.sh` — LaunchAgent 등록 (`RunAtLoad` + `KeepAlive`로 상시 구동, 죽으면 자동 재시작) | `launchctl unload ~/Library/LaunchAgents/com.slack-claude-assistant.plist` |
 | Windows | `scripts\register_scheduled_task.ps1` — 로그온 시 작업 스케줄러로 기동 (실패 시 최대 3회 재시작) | `scripts\unregister_scheduled_task.ps1` |
 
 두 스크립트 모두 `.venv`의 파이썬을 직접 지정해 실행하므로 `scripts/setup`을 먼저 실행해 둬야 합니다. 데몬으로 띄우면 PATH가 로그인 셸보다 축소되어 `claude` CLI를 못 찾을 수 있습니다 — 이럴 때 `.env`에 `CLAUDE_BIN`을 절대경로로 지정하세요. `scripts/check_claude.sh` / `check_claude.ps1`으로 봇이 실제로 쓸 `claude` 바이너리(`.env`의 `CLAUDE_BIN` → PATH 순으로 탐색)에 정상적으로 연결되는지 미리 진단할 수 있습니다.
@@ -234,14 +329,14 @@ CI(`.github/workflows/ci.yml`)도 동일하게 `uv run pytest -q`를 macOS/Linux
 
 ## 🔐 보안 모델 — 반드시 읽어주세요
 
-claudecord는 **Discord 메시지 한 통으로 내 PC에서 Claude Code CLI를 실행하는** 도구입니다.
+claudecord는 **Slack 메시지 한 통으로 내 PC에서 Claude Code CLI를 실행하는** 도구입니다.
 이 봇에 메시지를 보낼 수 있는 사람은 **내 계정 권한으로 무엇이든 할 수 있습니다.**
 
 ### 실제 방어선은 하나입니다
 
 | 계층 | 무엇을 막나 | 실효성 |
 |---|---|---|
-| `OWNER_DISCORD_ID` / `ALLOWED_CHANNEL_IDS` 화이트리스트 | 다른 사람의 명령 | ✅ **유일한 실질 방어선** |
+| `OWNER_SLACK_ID` / `ALLOWED_CHANNEL_IDS` 화이트리스트 | 다른 사람의 명령 | ✅ **유일한 실질 방어선** |
 | `--disallowedTools` (`rm`, `sudo`, `curl` 등) | 실수로 나간 파괴적 명령 | ⚠️ 사고 방지용에 한함 |
 | `--tools` (도구 28개 → 9개) | 봇이 안 쓰는 도구 전부 | ⚠️ 표면 축소이지 격리는 아님 |
 | 프롬프트 규칙("두 디렉터리 밖에는 쓰지 않는다") | — | ❌ 강제력 없음 |
@@ -281,7 +376,7 @@ Claude Code 2.1.251에서 직접 실험해 확인한 동작은 다음과 같습�
 
 ### 정리하면
 
-> **Discord 계정이 탈취되거나 `ALLOWED_CHANNEL_IDS`를 잘못 설정하면,
+> **Slack 계정이 탈취되거나 `ALLOWED_CHANNEL_IDS`를 잘못 설정하면,
 > 그 즉시 내 PC에 대한 원격 코드 실행 권한을 넘겨준 것과 같습니다.**
 > 봇이 실행 중인 사용자 계정이 접근할 수 있는 모든 파일 — SSH 키, 브라우저 프로필,
 > 클라우드 자격증명을 포함해 — 이 열려 있다고 가정하세요.
@@ -289,12 +384,12 @@ Claude Code 2.1.251에서 직접 실험해 확인한 동작은 다음과 같습�
 또한 **신뢰할 수 없는 저장소**를 봇의 작업 대상으로 삼지 마세요.
 그 저장소의 README·이슈·소스 주석에 심어둔 지시문이 모델 컨텍스트로 들어가고
 (간접 프롬프트 인젝션), `WebFetch`를 통해 읽은 내용이 외부로 나갈 수 있습니다.
-이 경로는 지시를 넣는 주체가 Discord 사용자가 아니기 때문에
+이 경로는 지시를 넣는 주체가 Slack 사용자가 아니기 때문에
 소유자 화이트리스트로 막을 수 없습니다.
 
 ### 권장 운용 수칙
 
-1. **Discord 계정에 2단계 인증(2FA)을 켜세요.** 사실상 유일한 자물쇠입니다.
+1. **Slack 계정에 2단계 인증(2FA)을 켜세요.** 사실상 유일한 자물쇠입니다.
 2. **`ALLOWED_CHANNEL_IDS`를 반드시 설정하세요.** 다만 이 값을 채워도
    **소유자 계정의 DM은 채널 검사를 건너뛰고 언제나 허용됩니다.**
    채널을 좁혔다고 해서 경로가 하나로 줄어드는 것이 아닙니다.
@@ -306,7 +401,7 @@ Claude Code 2.1.251에서 직접 실험해 확인한 동작은 다음과 같습�
 
 ## 💬 사용 예시
 
-Discord 채널에 그냥 자연어로 말하면 됩니다.
+Slack 채널에 그냥 자연어로 말하면 됩니다.
 
 ```
 나: 안녕?
