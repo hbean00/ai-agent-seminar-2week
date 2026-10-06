@@ -8,10 +8,11 @@ import tempfile
 import threading
 import unittest
 from datetime import UTC, datetime, timedelta
+from datetime import time as dtime
 from pathlib import Path
 from unittest import mock
 
-from src import auth, main, orchestrator, runner, sessions
+from src import auth, main, orchestrator, runner, schedules, sessions
 from src.parser import Command
 from src.sessions import SessionState
 from src.status import QUEUED_MESSAGE, WORKING_MESSAGE, run_spinning_loader
@@ -397,16 +398,13 @@ class FakeAck:
         self.edits.append(content)
 
 
-class FakeAuthor:
-    bot = False
-    id = 1
-
-
 class FakeMessage:
     def __init__(self, text: str, channel: FakeChannel, ack: FakeAck):
-        self.clean_content = text
+        self.text = text
         self.channel = channel
-        self.author = FakeAuthor()
+        self.author_id = "U01OWNER"
+        self.is_bot = False
+        self.is_dm = False
         self._ack = ack
         self.reply_calls = []
 
@@ -515,7 +513,6 @@ class OnMessageFlowTests(unittest.TestCase):
         self.assertEqual(len(msg.reply_calls), 1)
         gif_file = msg.reply_calls[0]["file"]
         self.assertIsNotNone(gif_file)
-        gif_file.close()  # m5: avoid a ResourceWarning from the open handle
 
     def test_on_message_completes_and_forwards_answer_even_if_a_status_task_crashes(self):
         # m6 / M1 regression, migrated from the deleted stream tailer to the
@@ -1968,13 +1965,23 @@ class LoggingConfigurationTests(unittest.TestCase):
         self.assertIn("%(levelname)s", fmt)
         self.assertIn("%(name)s", fmt)
 
-    def test_on_ready_logs_the_connection_instead_of_printing_it(self):
-        with (
-            tempfile.TemporaryDirectory() as tmp,
-            mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
-            self.assertLogs("src.main", level="INFO") as captured,
-        ):
-            asyncio.run(main.on_ready())
+    def test_startup_logs_the_connection_instead_of_printing_it(self):
+        # Under launchd / Task Scheduler nobody is watching a terminal, so the
+        # one line that says the bot actually connected has to be in the log.
+        async def scenario():
+            app = mock.MagicMock()
+            app.client.auth_test = mock.AsyncMock(return_value={"user": "claudecord"})
+            handler = mock.MagicMock()
+            handler.start_async = mock.AsyncMock()
+            with (
+                mock.patch.object(main, "AsyncApp", return_value=app),
+                mock.patch.object(main, "AsyncSocketModeHandler", return_value=handler),
+                mock.patch.object(main, "_startup_sweep", mock.AsyncMock()),
+            ):
+                await main._run_bot("xoxb-t", "xapp-t")
+
+        with self.assertLogs("src.main", level="INFO") as captured:
+            asyncio.run(scenario())
 
         self.assertTrue(any("logged in as" in line for line in captured.output))
 
@@ -1992,48 +1999,56 @@ class StartupWiringTests(unittest.TestCase):
         with (
             mock.patch.object(main, "ensure_configured") as ensure_configured,
             mock.patch.object(main, "_configure_logging") as configure_logging,
-            mock.patch.object(main.client, "run") as run,
-            mock.patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "t"}, clear=False),
+            mock.patch.object(main, "_run_bot") as run_bot,
+            mock.patch.object(main.asyncio, "run") as asyncio_run,
+            mock.patch.dict(
+                os.environ,
+                {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_APP_TOKEN": "xapp-t"},
+                clear=False,
+            ),
         ):
             main.main()
 
         ensure_configured.assert_called_once_with()
         configure_logging.assert_called_once_with()
-        run.assert_called_once_with("t")
+        run_bot.assert_called_once_with("xoxb-t", "xapp-t")
+        asyncio_run.assert_called_once()
 
     def test_a_missing_owner_id_stops_startup_with_a_korean_message(self):
         auth._config.cache_clear()
         with (
-            mock.patch.dict(os.environ, {"DISCORD_BOT_TOKEN": "t"}, clear=True),
-            mock.patch.object(main.client, "run") as run,
+            mock.patch.dict(os.environ, {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_APP_TOKEN": "xapp-t"}, clear=True),
+            mock.patch.object(main, "_run_bot") as run,
             mock.patch.object(main, "_configure_logging"),
             self.assertRaises(RuntimeError) as caught,
         ):
             main.main()
 
-        self.assertIn("OWNER_DISCORD_ID", str(caught.exception))
+        self.assertIn("OWNER_SLACK_ID", str(caught.exception))
         self.assertIn("환경변수", str(caught.exception))
         # It stopped *before* connecting, which is the point.
         run.assert_not_called()
 
     def test_a_missing_bot_token_stops_startup_with_a_korean_message(self):
         # ensure_configured() covers who may talk to the bot, not the bot's own
-        # credential, so without this check a missing token surfaced as a bare
+        # credentials, so without this check a missing token surfaced as a bare
         # KeyError traceback while every other config error got a sentence.
+        # Two tokens now: the bot token signs Web API calls, the app token
+        # opens the Socket Mode websocket.
         auth._config.cache_clear()
         with (
             mock.patch.dict(
                 os.environ,
-                {"OWNER_DISCORD_ID": "1", "ALLOWED_CHANNEL_IDS": "2"},
+                {"OWNER_SLACK_ID": "U01OWNER", "ALLOWED_CHANNEL_IDS": "C01ALLOW"},
                 clear=True,
             ),
-            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_run_bot") as run,
             mock.patch.object(main, "_configure_logging"),
             self.assertRaises(RuntimeError) as caught,
         ):
             main.main()
 
-        self.assertIn("DISCORD_BOT_TOKEN", str(caught.exception))
+        self.assertIn("SLACK_BOT_TOKEN", str(caught.exception))
         self.assertIn("환경변수", str(caught.exception))
         run.assert_not_called()
 
@@ -2042,16 +2057,16 @@ class StartupWiringTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"OWNER_DISCORD_ID": "1", "ALLOWED_CHANNEL_IDS": "2", "DISCORD_BOT_TOKEN": ""},
+                {"OWNER_SLACK_ID": "U01OWNER", "ALLOWED_CHANNEL_IDS": "C01ALLOW", "SLACK_BOT_TOKEN": ""},
                 clear=True,
             ),
-            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_run_bot") as run,
             mock.patch.object(main, "_configure_logging"),
             self.assertRaises(RuntimeError) as caught,
         ):
             main.main()
 
-        self.assertIn("DISCORD_BOT_TOKEN", str(caught.exception))
+        self.assertIn("SLACK_BOT_TOKEN", str(caught.exception))
         run.assert_not_called()
 
     def test_a_malformed_owner_id_also_stops_startup(self):
@@ -2059,16 +2074,16 @@ class StartupWiringTests(unittest.TestCase):
         with (
             mock.patch.dict(
                 os.environ,
-                {"DISCORD_BOT_TOKEN": "t", "OWNER_DISCORD_ID": "not-a-number"},
+                {"SLACK_BOT_TOKEN": "xoxb-t", "SLACK_APP_TOKEN": "xapp-t", "OWNER_SLACK_ID": "not-an-id"},
                 clear=True,
             ),
-            mock.patch.object(main.client, "run") as run,
+            mock.patch.object(main, "_run_bot") as run,
             mock.patch.object(main, "_configure_logging"),
             self.assertRaises(RuntimeError) as caught,
         ):
             main.main()
 
-        self.assertIn("OWNER_DISCORD_ID", str(caught.exception))
+        self.assertIn("OWNER_SLACK_ID", str(caught.exception))
         run.assert_not_called()
 
 
@@ -2085,7 +2100,7 @@ class StartupCleanupWiringTests(unittest.TestCase):
         )
         return job_dir
 
-    def test_on_ready_sweeps_stale_run_directories(self):
+    def test_startup_sweeps_stale_run_directories(self):
         # End to end against the real cleanup_old_runs: a job older than the
         # default 30-day retention goes, a fresh one stays.
         with tempfile.TemporaryDirectory() as tmp:
@@ -2096,12 +2111,12 @@ class StartupCleanupWiringTests(unittest.TestCase):
 
             with mock.patch.dict(os.environ, {"RUNS_DIR": str(runs)}, clear=False):
                 os.environ.pop("RUNS_RETENTION_DAYS", None)
-                asyncio.run(main.on_ready())
+                asyncio.run(main._startup_sweep())
 
             self.assertFalse(stale.exists())
             self.assertTrue(fresh.exists())
 
-    def test_on_ready_honours_the_retention_opt_out(self):
+    def test_the_sweep_honours_the_retention_opt_out(self):
         with tempfile.TemporaryDirectory() as tmp:
             runs = Path(tmp) / "runs"
             runs.mkdir()
@@ -2110,7 +2125,7 @@ class StartupCleanupWiringTests(unittest.TestCase):
             with mock.patch.dict(
                 os.environ, {"RUNS_DIR": str(runs), "RUNS_RETENTION_DAYS": "0"}, clear=False
             ):
-                asyncio.run(main.on_ready())
+                asyncio.run(main._startup_sweep())
 
             self.assertTrue(stale.exists())
 
@@ -2129,12 +2144,12 @@ class StartupCleanupWiringTests(unittest.TestCase):
             mock.patch.object(main, "cleanup_old_runs", recording_cleanup),
             mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
         ):
-            asyncio.run(main.on_ready())
+            asyncio.run(main._startup_sweep())
 
         self.assertEqual(len(threads), 1)
         self.assertNotEqual(threads[0], threading.main_thread())
 
-    def test_a_failed_delete_does_not_stop_on_ready(self):
+    def test_a_failed_delete_does_not_stop_the_sweep(self):
         # cleanup_old_runs swallows and logs its own failures, so on_ready
         # needs no try/except of its own -- this pins that contract rather
         # than the wrapper it would otherwise tempt someone to add.
@@ -2153,18 +2168,270 @@ class StartupCleanupWiringTests(unittest.TestCase):
             ):
                 os.environ.pop("RUNS_RETENTION_DAYS", None)
                 # The point: this returns normally rather than raising.
-                asyncio.run(main.on_ready())
+                asyncio.run(main._startup_sweep())
 
             self.assertTrue(stale.exists())
 
-    def test_on_ready_still_announces_the_connection_when_nothing_is_swept(self):
+    def test_a_sweep_with_nothing_to_remove_stays_silent(self):
+        # The counterpart to the sweep test above: an operator reading the log
+        # should see a cleanup line only when cleanup actually happened.
+        # (That the bot announces its connection at all is pinned by
+        # test_startup_logs_the_connection_instead_of_printing_it, which now
+        # covers _run_bot rather than the gateway's on_ready.)
         with (
             tempfile.TemporaryDirectory() as tmp,
             mock.patch.dict(os.environ, {"RUNS_DIR": tmp}, clear=False),
-            self.assertLogs("src.main", level="INFO") as captured,
+            self.assertNoLogs("src.main", level="INFO"),
         ):
-            asyncio.run(main.on_ready())
+            asyncio.run(main._startup_sweep())
 
-        self.assertTrue(any("logged in as" in line for line in captured.output))
-        # Nothing was removed, so there is no cleanup line to add noise.
-        self.assertFalse(any("stale run directories" in line for line in captured.output))
+
+class _ScheduleStoreTestCase(unittest.TestCase):
+    """Repoints the schedule store at a temp file so no test touches ~/.claudecord."""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        patcher = mock.patch.object(
+            schedules, "_STORE_PATH", Path(self._tmp.name) / "schedules.json"
+        )
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        schedules._store_cache.clear()
+        self.addCleanup(schedules._store_cache.clear)
+
+
+class ScheduleCommandTests(_ScheduleStoreTestCase):
+    def test_listing_with_nothing_registered_says_so(self):
+        msg = FakeMessage("예약 목록", FakeChannel("C01"), FakeAck())
+        handled = asyncio.run(main._handle_schedule_commands(msg, "예약 목록"))
+
+        self.assertTrue(handled)
+        self.assertIn("등록된 예약이 없습니다", msg.reply_calls[0]["content"])
+
+    def test_listing_shows_the_id_schedule_and_prompt(self):
+        added = schedules.add_schedule("C01", "뉴스 요약", schedules.DAILY, dtime(7, 0))
+        msg = FakeMessage("예약 목록", FakeChannel("C01"), FakeAck())
+
+        asyncio.run(main._handle_schedule_commands(msg, "예약 목록"))
+
+        reply = msg.reply_calls[0]["content"]
+        self.assertIn(added.id, reply)
+        self.assertIn("매일 07:00", reply)
+        self.assertIn("뉴스 요약", reply)
+
+    def test_listing_is_scoped_to_the_channel_that_asked(self):
+        schedules.add_schedule("C01", "mine", schedules.DAILY, dtime(7, 0))
+        schedules.add_schedule("C02", "theirs", schedules.DAILY, dtime(8, 0))
+        msg = FakeMessage("예약 목록", FakeChannel("C01"), FakeAck())
+
+        asyncio.run(main._handle_schedule_commands(msg, "예약 목록"))
+
+        reply = msg.reply_calls[0]["content"]
+        self.assertIn("mine", reply)
+        self.assertNotIn("theirs", reply)
+
+    def test_deleting_removes_it(self):
+        added = schedules.add_schedule("C01", "뉴스", schedules.DAILY, dtime(7, 0))
+        msg = FakeMessage("", FakeChannel("C01"), FakeAck())
+
+        handled = asyncio.run(main._handle_schedule_commands(msg, "예약 삭제 " + added.id))
+
+        self.assertTrue(handled)
+        self.assertEqual(schedules.list_schedules(), [])
+
+    def test_deleting_an_unknown_id_says_so_instead_of_failing_silently(self):
+        msg = FakeMessage("", FakeChannel("C01"), FakeAck())
+        asyncio.run(main._handle_schedule_commands(msg, "예약 삭제 deadbeef"))
+        self.assertIn("찾지 못했습니다", msg.reply_calls[0]["content"])
+
+    def test_an_ordinary_message_is_not_a_schedule_command(self):
+        msg = FakeMessage("", FakeChannel("C01"), FakeAck())
+        handled = asyncio.run(main._handle_schedule_commands(msg, "뉴스 요약해줘"))
+        self.assertFalse(handled)
+        self.assertEqual(msg.reply_calls, [])
+
+
+class ScheduleRegistrationTests(_ScheduleStoreTestCase):
+    def test_an_ordinary_message_never_pays_for_extraction(self):
+        # The whole point of the cheap filter: a normal job must not spawn a
+        # second CLI just to find out it was not a schedule.
+        with mock.patch.object(main, "run_claude_stream") as stream:
+            handled = asyncio.run(
+                main._try_register_schedule(
+                    FakeMessage("", FakeChannel("C01"), FakeAck()), "뉴스 요약해줘"
+                )
+            )
+
+        self.assertFalse(handled)
+        stream.assert_not_called()
+
+    def test_a_recognised_request_is_stored_and_confirmed(self):
+        ack = FakeAck()
+        msg = FakeMessage("", FakeChannel("C01"), ack)
+
+        async def fake_stream(*args, **kwargs):
+            yield {
+                "type": "result",
+                "result": '{"is_schedule": true, "kind": "daily",'
+                ' "at": "07:00", "prompt": "뉴스 요약"}',
+            }
+
+        with mock.patch.object(main, "run_claude_stream", fake_stream):
+            handled = asyncio.run(
+                main._try_register_schedule(msg, "매일 아침 7시에 뉴스 요약해줘")
+            )
+
+        self.assertTrue(handled)
+        [stored] = schedules.list_schedules("C01")
+        self.assertEqual(stored.prompt, "뉴스 요약")
+        self.assertEqual(stored.at, dtime(7, 0))
+        # The confirmation names the schedule and how to remove it again.
+        confirmation = ack.edits[-1]
+        self.assertIn("매일 07:00", confirmation)
+        self.assertIn(stored.id, confirmation)
+
+    def test_a_message_that_merely_mentions_a_recurring_word_runs_as_a_job(self):
+        # "매일 쓰는 스크립트 고쳐줘" trips the cheap filter on purpose; the
+        # model rejects it, and the turn must then proceed as the ordinary job
+        # it always was rather than dying between the two paths.
+        msg = FakeMessage("", FakeChannel("C01"), FakeAck())
+
+        async def fake_stream(*args, **kwargs):
+            yield {"type": "result", "result": '{"is_schedule": false}'}
+
+        with mock.patch.object(main, "run_claude_stream", fake_stream):
+            handled = asyncio.run(main._try_register_schedule(msg, "매일 쓰는 스크립트 고쳐줘"))
+
+        self.assertFalse(handled)
+        self.assertEqual(schedules.list_schedules(), [])
+
+    def test_a_dead_cli_does_not_strand_the_turn(self):
+        msg = FakeMessage("", FakeChannel("C01"), FakeAck())
+
+        async def failing_stream(*args, **kwargs):
+            raise RuntimeError("claude is gone")
+            yield  # pragma: no cover -- makes this an async generator
+
+        with mock.patch.object(main, "run_claude_stream", failing_stream):
+            handled = asyncio.run(main._try_register_schedule(msg, "매일 아침 뉴스 요약해줘"))
+
+        self.assertFalse(handled)
+        self.assertEqual(schedules.list_schedules(), [])
+
+
+class SchedulerLoopTests(_ScheduleStoreTestCase):
+    def _run_due(self, now):
+        client = mock.MagicMock()
+        client.chat_postMessage = mock.AsyncMock(return_value={"ts": "1700.0001"})
+        dispatched = []
+
+        async def fake_dispatch(msg, cmd, job_dir, timings):
+            dispatched.append((msg, cmd))
+
+        async def scenario():
+            with (
+                mock.patch.object(main, "_dispatch_job", fake_dispatch),
+                mock.patch.object(main, "allocate_job", return_value=Path("runs/job-x")),
+            ):
+                count = await main._run_due_schedules(client, now=now)
+                # Let the per-schedule task created inside actually run.
+                await asyncio.sleep(0)
+                await asyncio.sleep(0)
+            return count
+
+        count = asyncio.run(scenario())
+        return count, client, dispatched
+
+    def test_a_due_schedule_posts_a_header_and_dispatches_the_job(self):
+        schedules.add_schedule(
+            "C01",
+            "뉴스 요약",
+            schedules.DAILY,
+            dtime(7, 0),
+            now=datetime(2026, 3, 1, 6, 0),
+        )
+
+        count, client, dispatched = self._run_due(datetime(2026, 3, 1, 7, 0))
+
+        self.assertEqual(count, 1)
+        header = client.chat_postMessage.await_args.kwargs["text"]
+        self.assertIn("예약 작업", header)
+        self.assertIn("매일 07:00", header)
+        self.assertEqual(len(dispatched), 1)
+        self.assertEqual(dispatched[0][0].text, "뉴스 요약")
+
+    def test_everything_the_job_says_lands_under_the_header(self):
+        # Otherwise the ack, the progress edits and the attachments would be
+        # three loose messages scattered through the channel.
+        schedules.add_schedule(
+            "C01", "뉴스", schedules.DAILY, dtime(7, 0), now=datetime(2026, 3, 1, 6, 0)
+        )
+        _, _, dispatched = self._run_due(datetime(2026, 3, 1, 7, 0))
+        self.assertEqual(dispatched[0][0].channel.thread_ts, "1700.0001")
+
+    def test_a_late_run_says_it_is_late(self):
+        schedules.add_schedule(
+            "C01", "뉴스", schedules.DAILY, dtime(7, 0), now=datetime(2026, 2, 28, 6, 0)
+        )
+        _, client, _ = self._run_due(datetime(2026, 3, 1, 9, 40))
+        header = client.chat_postMessage.await_args.kwargs["text"]
+        self.assertIn("07:00", header)
+        self.assertIn("지금 실행", header)
+
+    def test_an_on_time_run_does_not_claim_to_be_late(self):
+        schedules.add_schedule(
+            "C01", "뉴스", schedules.DAILY, dtime(7, 0), now=datetime(2026, 2, 28, 6, 0)
+        )
+        _, client, _ = self._run_due(datetime(2026, 3, 1, 7, 0))
+        self.assertNotIn("지금 실행", client.chat_postMessage.await_args.kwargs["text"])
+
+    def test_the_slot_is_closed_before_the_job_runs(self):
+        # A job that crashes or takes twenty minutes must not leave the slot
+        # open for the next tick to pick up again.
+        schedules.add_schedule(
+            "C01", "뉴스", schedules.DAILY, dtime(7, 0), now=datetime(2026, 3, 1, 6, 0)
+        )
+        self._run_due(datetime(2026, 3, 1, 7, 0))
+
+        count, _, _ = self._run_due(datetime(2026, 3, 1, 7, 1))
+        self.assertEqual(count, 0)
+
+    def test_nothing_due_means_no_message_at_all(self):
+        schedules.add_schedule(
+            "C01", "뉴스", schedules.DAILY, dtime(7, 0), now=datetime(2026, 3, 1, 9, 0)
+        )
+        count, client, dispatched = self._run_due(datetime(2026, 3, 1, 9, 5))
+        self.assertEqual(count, 0)
+        client.chat_postMessage.assert_not_awaited()
+        self.assertEqual(dispatched, [])
+
+    def test_one_bad_tick_does_not_end_every_schedule(self):
+        # The loop is the only thing driving every schedule in the store, so
+        # it has to outlive a failure inside a single tick.
+        ticks = []
+
+        async def flaky(client, **kwargs):
+            ticks.append(1)
+            if len(ticks) == 1:
+                raise RuntimeError("boom")
+            return 0
+
+        async def scenario():
+            with (
+                mock.patch.object(main, "_run_due_schedules", flaky),
+                mock.patch.object(main, "SCHEDULER_TICK_SECONDS", 0),
+            ):
+                task = asyncio.create_task(main._scheduler_loop(mock.MagicMock()))
+                for _ in range(200):
+                    await asyncio.sleep(0)
+                    if len(ticks) >= 3:
+                        break
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+        with self.assertLogs("src.main", level="ERROR"):
+            asyncio.run(scenario())
+
+        self.assertGreaterEqual(len(ticks), 3)

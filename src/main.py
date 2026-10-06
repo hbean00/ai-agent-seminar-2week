@@ -1,23 +1,29 @@
 import asyncio
 import logging
 import os
+from datetime import datetime
 from pathlib import Path
 
-import discord
 from dotenv import load_dotenv
+from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
+from slack_bolt.app.async_app import AsyncApp
+from slack_sdk.errors import SlackClientError
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parents[1] / ".env")
 
+from src import schedules
 from src.auth import ensure_configured, is_authorized
+from src.chat import ChatChannel, IncomingMessage, ScheduledMessage, SentMessage
 from src.errors import redact_paths, safe_error_text
 from src.greetings import direct_reply_for
 from src.orchestrator import allocate_job, cleanup_old_runs, prepare_job, run_job
-from src.outputs import send_outputs
+from src.outputs import CHUNK_LIMIT, send_outputs
 from src.parser import parse
 from src.runner import (
     JobProcessScope,
     TerminationSummary,
     get_warm_pool,
+    run_claude_stream,
     terminate_active_claude_processes,
     terminate_job_processes,
 )
@@ -43,6 +49,17 @@ logger = logging.getLogger(__name__)
 MISSING_CONVERSATION_MARKER = "No conversation found with session ID"
 SHUTDOWN_COMMAND = "종료"
 
+# Scheduled jobs run as their own tasks, so the event loop holds only a weak
+# reference to them: without this set a morning job could be garbage-collected
+# mid-run. Discarded on completion so the set does not grow for the life of the
+# process.
+_SCHEDULED_TASKS: set[asyncio.Task] = set()
+
+# How often the scheduler wakes to look for due jobs. A minute is finer
+# than any schedule this accepts (HH:MM) needs, and coarse enough that the
+# tick costs nothing: it reads a cached dict unless the store changed.
+SCHEDULER_TICK_SECONDS = 60.0
+
 # Where a failed turn keeps its message, depending on how the CLI reported it.
 # The cold path surfaces a dead process as {"type": "error", "text": ...}, but
 # a warm process reports the same stale-session failure *in band* as
@@ -57,7 +74,7 @@ ERROR_TEXT_KEYS = ("text", "result", "error")
 JOB_TIMEOUT_ENV_VAR = "JOB_TIMEOUT_SECONDS"
 DEFAULT_JOB_TIMEOUT_SECONDS = 600.0
 
-# Issue #6: discord.py dispatches every message as its own task, so three
+# Issue #6: Bolt dispatches every message event as its own task, so three
 # messages in a row used to spawn three claude CLIs that slow each other
 # down. Excess jobs now queue behind this gate and say so.
 MAX_CONCURRENT_JOBS_ENV_VAR = "MAX_CONCURRENT_JOBS"
@@ -73,10 +90,6 @@ LOG_LEVEL_ENV_VAR = "LOG_LEVEL"
 DEFAULT_LOG_LEVEL = logging.INFO
 LOG_LEVEL_NAMES = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
 LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
-
-intents = discord.Intents.default()
-intents.message_content = True
-client = discord.Client(intents=intents)
 
 # (limit, loop, semaphore) for the gate currently in use, plus the number of
 # jobs holding or waiting for a slot. Rebuilt lazily -- see _resolve_job_gate.
@@ -284,7 +297,7 @@ async def _shutdown_claude_sessions() -> tuple[TerminationSummary, int]:
     return summary, cleared_sessions
 
 
-async def _safe_edit_ack(ack: discord.Message, content: str) -> None:
+async def _safe_edit_ack(ack: SentMessage, content: str) -> None:
     """Best-effort edit of the ack message with its final status.
 
     A failure here (message deleted, permission change, transient network
@@ -294,12 +307,12 @@ async def _safe_edit_ack(ack: discord.Message, content: str) -> None:
     """
     try:
         await ack.edit(content=content)
-    except (discord.DiscordException, OSError):
+    except (SlackClientError, OSError):
         logger.warning("Failed to edit ack message with final status", exc_info=True)
 
 
 async def _complete_job(
-    ack: discord.Message,
+    ack: SentMessage,
     status_line: str,
     job_dir: Path,
     timings: JobTimings,
@@ -317,17 +330,153 @@ async def _complete_job(
         await _safe_edit_ack(ack, f"{status_line}\n{summary}")
 
 
-@client.event
-async def on_ready():
-    logger.info("logged in as %s", client.user)
+# --------------------------------------------------------------- schedules
 
+async def _handle_schedule_commands(msg, text: str) -> bool:
+    """Handle 예약 목록 / 예약 삭제. Returns whether the message was one.
+
+    Exact matches, checked before the natural-language path: listing and
+    deleting are unambiguous, and paying for a CLI call to recognise
+    "예약 목록" would be absurd.
+    """
+    if schedules.parse_list_command(text):
+        registered = schedules.list_schedules(msg.channel.id)
+        if not registered:
+            await msg.reply("등록된 예약이 없습니다.")
+            return True
+        lines = [
+            f"- `{item.id}` · {item.describe()} · {item.prompt}" for item in registered
+        ]
+        await msg.reply("등록된 예약:\n" + "\n".join(lines) + "\n\n삭제: `예약 삭제 <id>`")
+        return True
+
+    schedule_id = schedules.parse_delete_command(text)
+    if schedule_id is not None:
+        if schedules.remove_schedule(schedule_id):
+            await msg.reply(f"예약 `{schedule_id}`을 삭제했습니다.")
+        else:
+            await msg.reply(f"`{schedule_id}` 예약을 찾지 못했습니다. `예약 목록`으로 확인하세요.")
+        return True
+
+    return False
+
+
+async def _extract_schedule(text: str) -> schedules.ScheduleSpec | None:
+    """Ask the CLI to read a recurring schedule out of ``text``.
+
+    Reached only for messages the cheap filter flagged, so an ordinary job
+    never pays for this. Any failure -- a dead CLI, prose instead of JSON, a
+    message that merely mentioned 매일 -- returns None and the caller runs the
+    message as the normal job it probably always was.
+    """
+    collected = []
+    try:
+        async for event in run_claude_stream(
+            schedules.EXTRACTION_PROMPT.format(text=text),
+            system_hint=schedules.EXTRACTION_SYSTEM_HINT,
+        ):
+            if event.get("type") == "result":
+                collected.append(str(event.get("result") or ""))
+            elif event.get("type") == "error":
+                logger.warning("schedule extraction failed: %s", event.get("text"))
+                return None
+    except Exception:
+        logger.exception("schedule extraction raised")
+        return None
+
+    return schedules.parse_extraction("\n".join(collected))
+
+
+async def _try_register_schedule(msg, text: str) -> bool:
+    """Register a recurring job if that is what the message asked for."""
+    if not schedules.looks_like_schedule_request(text):
+        return False
+
+    notice = await msg.reply("예약 요청으로 보입니다. 시각을 해석하는 중...")
+    spec = await _extract_schedule(text)
+    if spec is None:
+        # Not a schedule after all (or the parse failed): say so and fall
+        # through, so the message still runs as an ordinary job.
+        await _safe_edit_ack(notice, "예약으로 해석하지 못해 일반 작업으로 실행합니다.")
+        return False
+
+    schedule = schedules.add_schedule(
+        msg.channel.id, spec.prompt, spec.kind, spec.at, spec.weekdays
+    )
+    upcoming = schedules.next_slot(schedule, datetime.now())
+    await _safe_edit_ack(
+        notice,
+        f"예약 등록 완료 · `{schedule.id}`\n"
+        f"{schedule.describe()}에 실행합니다 (다음: {upcoming:%m월 %d일 %H:%M})\n"
+        f"내용: {spec.prompt}\n\n"
+        f"목록은 `예약 목록`, 삭제는 `예약 삭제 {schedule.id}`",
+    )
+    return True
+
+
+async def _run_due_schedules(client, *, now: datetime | None = None) -> int:
+    """Fire every schedule whose slot has passed. Returns how many ran."""
+    now = now or datetime.now()
+    due = schedules.due_schedules(now)
+    for schedule in due:
+        slot = schedules.previous_slot(schedule, now)
+        # Marked before the job runs, not after: a job that crashes or takes
+        # twenty minutes must not leave the slot open for the next tick.
+        schedules.mark_ran(schedule.id, now=now)
+
+        header = f"⏰ 예약 작업 · {schedule.describe()}"
+        if slot is not None and now - slot > schedules.LATE_RUN_THRESHOLD:
+            # Say it out loud rather than letting a 09:40 run read as 07:00.
+            header += f"\n(예정 {slot:%H:%M}, PC가 꺼져 있어 지금 실행합니다)"
+
+        channel = ChatChannel(client, schedule.channel_id)
+        root = await channel.send(header)
+        if root is not None:
+            # Everything the job says now lands under this one root.
+            channel.thread_ts = root.ts
+
+        timings = JobTimings()
+        timings.start(SPAN_TOTAL)
+        timings.start(SPAN_ACK)
+        job_dir = await asyncio.to_thread(allocate_job)
+        timings.job_id = job_dir.name
+        # Its own task, like an inbound message: a long morning job must not
+        # hold up the one scheduled a minute after it. MAX_CONCURRENT_JOBS
+        # still serialises the actual CLI runs.
+        task = asyncio.create_task(
+            _dispatch_job(
+                ScheduledMessage(channel, schedule.prompt),
+                parse(schedule.prompt),
+                job_dir,
+                timings,
+            )
+        )
+        _SCHEDULED_TASKS.add(task)
+        task.add_done_callback(_SCHEDULED_TASKS.discard)
+    return len(due)
+
+
+async def _scheduler_loop(client) -> None:
+    """Tick forever. Never dies: one bad tick must not end every schedule."""
+    while True:
+        await asyncio.sleep(SCHEDULER_TICK_SECONDS)
+        try:
+            ran = await _run_due_schedules(client)
+        except Exception:
+            logger.exception("scheduler tick failed")
+        else:
+            if ran:
+                logger.info("scheduler started %s due job(s)", ran)
+
+
+async def _startup_sweep() -> None:
     # Issue #22: startup is the only sweep this bot gets, so it has to happen
     # here. Off the event loop, though: this is an rmtree over up to a
     # retention window's worth of job directories (each with its own outputs
-    # and logs), and on_ready shares the loop with discord.py's gateway
-    # heartbeat -- a long blocking delete there reads as a dead connection and
-    # drops the session. Same reason the job-file writes moved off the loop in
-    # issue #3.
+    # and logs), and the loop it would block is the one carrying the Socket
+    # Mode websocket -- a long blocking delete there reads as a dead
+    # connection and drops the session. Same reason the job-file writes moved
+    # off the loop in issue #3.
     #
     # Deliberately not wrapped: cleanup_old_runs catches and logs every one of
     # its own failures, so a try/except here would only obscure that contract.
@@ -336,11 +485,23 @@ async def on_ready():
         logger.info("removed %s stale run directories", removed)
 
 
-@client.event
-async def on_message(msg: discord.Message):
+async def _on_slack_message(event: dict, client) -> None:
+    """Bolt entry point: wrap the raw event, then run the normal flow.
+
+    Slack delivers edits, deletions, joins and channel-topic changes as
+    ``message`` events carrying a ``subtype``; none of them is a user asking
+    for anything, and a message_changed event would re-run a job the user
+    only reworded. Discord had no equivalent, so this filter is new.
+    """
+    if event.get("subtype") is not None:
+        return
+    await on_message(IncomingMessage(client, event))
+
+
+async def on_message(msg: IncomingMessage):
     if not is_authorized(msg):
         return
-    if not msg.clean_content.strip():
+    if not msg.text.strip():
         return
 
     # Issue #7: the clock starts the moment the message lands, so t_ack and
@@ -350,7 +511,7 @@ async def on_message(msg: discord.Message):
     timings.start(SPAN_TOTAL)
     timings.start(SPAN_ACK)
 
-    text = msg.clean_content.strip()
+    text = msg.text.strip()
 
     if text == "/clear":
         state = get_session_state(msg.channel.id)
@@ -366,9 +527,15 @@ async def on_message(msg: discord.Message):
         )
         return
 
+    if await _handle_schedule_commands(msg, text):
+        return
+
     direct_reply = direct_reply_for(text)
     if direct_reply:
         await msg.reply(direct_reply)
+        return
+
+    if await _try_register_schedule(msg, text):
         return
 
     cmd = parse(text)
@@ -383,7 +550,7 @@ async def on_message(msg: discord.Message):
 
 
 async def _dispatch_job(
-    msg: discord.Message,
+    msg: IncomingMessage,
     cmd,
     job_dir: Path,
     timings: JobTimings,
@@ -452,8 +619,8 @@ async def _dispatch_job(
 
 
 async def _prepare_queued_job(
-    msg: discord.Message,
-    ack: discord.Message,
+    msg: IncomingMessage,
+    ack: SentMessage,
     cmd,
     job_dir: Path,
     timings: JobTimings,
@@ -484,7 +651,7 @@ async def _prepare_queued_job(
         # The full message (with the real path) goes to the log, where the
         # operator can read it; the channel gets the redacted form. Issue #26:
         # prepare_job names the missing directory by absolute path, and a
-        # Discord message is permanent.
+        # Slack message is permanent.
         logger.warning("job %s could not be prepared: %s", job_dir.name, exc)
         status_line = f"작업 실패 · {job_dir.name}"
         await _safe_edit_ack(ack, status_line)
@@ -496,8 +663,8 @@ async def _prepare_queued_job(
 
 
 async def _execute_job(
-    msg: discord.Message,
-    ack: discord.Message,
+    msg: IncomingMessage,
+    ack: SentMessage,
     job_dir: Path,
     progress: JobProgress,
     timings: JobTimings,
@@ -581,7 +748,7 @@ async def _execute_job(
         # slicing first could cut a path in half and hand the tail through
         # unmatched.
         logger.warning("job %s failed: %s", job_dir.name, meta["text"])
-        await msg.channel.send(redact_paths(str(meta["text"]))[:1900])
+        await msg.channel.send(redact_paths(str(meta["text"]))[:CHUNK_LIMIT])
     await send_outputs(
         msg.channel,
         job_dir,
@@ -593,8 +760,8 @@ async def _execute_job(
 
 
 async def _handle_job_timeout(
-    msg: discord.Message,
-    ack: discord.Message,
+    msg: IncomingMessage,
+    ack: SentMessage,
     job_dir: Path,
     timings: JobTimings,
     timeout: float | None,
@@ -630,6 +797,44 @@ async def _handle_job_timeout(
     await _complete_job(ack, status_line, job_dir, timings)
 
 
+def _require_token(name: str, prefix: str) -> str:
+    """Read a Slack token, failing at startup the way ensure_configured does.
+
+    Two tokens, not one: the bot token authorises Web API calls, and the app
+    token is what opens the Socket Mode websocket. Swapping them is an easy
+    mistake with an unhelpful error from Slack much later, so the prefix is
+    checked here instead.
+    """
+    token = os.environ.get(name, "").strip()
+    if not token:
+        raise RuntimeError(f"환경변수 {name}이 필요합니다.")
+    if not token.startswith(prefix):
+        raise RuntimeError(f"환경변수 {name}은 {prefix}로 시작해야 합니다.")
+    return token
+
+
+async def _run_bot(bot_token: str, app_token: str) -> None:
+    app = AsyncApp(token=bot_token)
+    app.event("message")(_on_slack_message)
+
+    identity = await app.client.auth_test()
+    logger.info("logged in as %s", identity.get("user"))
+
+    await _startup_sweep()
+
+    # Started before the handler so a schedule missed overnight fires as soon
+    # as the bot is up, rather than waiting for someone to send a message.
+    scheduler = asyncio.create_task(_scheduler_loop(app.client))
+
+    # Socket Mode keeps the connection outbound, which is the whole reason
+    # this bot runs on a home PC with no public HTTPS endpoint -- the property
+    # the Discord gateway gave it and the Events API would have taken away.
+    try:
+        await AsyncSocketModeHandler(app, app_token).start_async()
+    finally:
+        scheduler.cancel()
+
+
 def main():
     # Logging first, so a configuration failure below is itself reportable.
     _configure_logging()
@@ -639,11 +844,10 @@ def main():
     # Same contract as ensure_configured(): a missing token is a configuration
     # error the operator should read, not a KeyError traceback. ensure_configured
     # does not cover it because auth.py is about who may talk to the bot, not
-    # about the bot's own credential.
-    token = os.environ.get("DISCORD_BOT_TOKEN")
-    if not token:
-        raise RuntimeError("환경변수 DISCORD_BOT_TOKEN이 필요합니다.")
-    client.run(token)
+    # about the bot's own credentials.
+    bot_token = _require_token("SLACK_BOT_TOKEN", "xoxb-")
+    app_token = _require_token("SLACK_APP_TOKEN", "xapp-")
+    asyncio.run(_run_bot(bot_token, app_token))
 
 
 if __name__ == "__main__":
