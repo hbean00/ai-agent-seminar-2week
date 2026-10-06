@@ -3,18 +3,25 @@ requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "discord-claude-assistant"
+name = "slack-claude-assistant"
 version = "0.1.0"
 requires-python = ">=3.11"
 license = "MIT"
 license-files = ["LICENSE"]
 dependencies = [
-    "discord.py>=2.4",
+    # Socket Mode is the reason this is slack-bolt rather than slack-sdk alone:
+    # it opens an outbound websocket, so the bot keeps running on a home PC
+    # with no public HTTPS endpoint -- the property the Discord gateway gave
+    # this project and the one the Events API would have taken away.
+    "slack-bolt>=1.21",
+    # Not transitive. slack-bolt installs without it, and
+    # slack_bolt.adapter.socket_mode.aiohttp then fails to import at startup.
+    "aiohttp>=3.9",
     "python-dotenv>=1.0",
 ]
 
 [project.scripts]
-discord-claude-assistant = "src.main:main"
+slack-claude-assistant = "src.main:main"
 
 [tool.setuptools.packages.find]
 include = ["src*"]
