@@ -306,23 +306,59 @@ class RunnerTests(unittest.TestCase):
 
         self.assertEqual(cmd[0], "/opt/claude/bin/claude")
 
-    def test_build_claude_command_wraps_windows_cmd_shim(self):
+    def test_build_claude_command_keeps_windows_cmd_shim_as_argv(self):
+        # The shim is not wrapped in COMSPEC here. That wrapping used to live
+        # in this list and got re-quoted by create_subprocess_exec on the way
+        # out -- every embedded quote became \", which cmd.exe forwards
+        # verbatim and the child then reads as a literal. _spawn_claude_process
+        # routes a batch file through create_subprocess_shell instead, so the
+        # command stays a plain argv list.
         with (
             mock.patch("src.runner.os.name", "nt"),
             mock.patch.dict(
                 os.environ,
-                {
-                    "CLAUDE_BIN": r"C:\Users\me\AppData\Roaming\npm\claude.cmd",
-                    "COMSPEC": r"C:\Windows\System32\cmd.exe",
-                },
+                {"CLAUDE_BIN": r"C:\Users\me\AppData\Roaming\npm\claude.cmd"},
                 clear=False,
             ),
         ):
             cmd = build_claude_command("hello & goodbye")
 
-        self.assertEqual(cmd[:4], [r"C:\Windows\System32\cmd.exe", "/d", "/s", "/c"])
-        self.assertIn("claude.cmd", cmd[4])
-        self.assertIn("hello & goodbye", cmd[4])
+        self.assertEqual(cmd[0], r"C:\Users\me\AppData\Roaming\npm\claude.cmd")
+        self.assertEqual(cmd[-2:], ["--", "hello & goodbye"])
+        self.assertTrue(runner._is_windows_batch_file(cmd[0]))
+
+    def test_run_claude_stream_delivers_spaced_arguments_intact(self):
+        # Regression for the Windows quoting bug: with the CLI behind a .cmd
+        # shim, every argument containing a space -- --disallowedTools is one,
+        # always, because of `chmod -R 777` -- reached the CLI split at its
+        # spaces, and the CLI refused every job with "unknown option '-R'".
+        # On POSIX this is trivially true; on Windows it drives the real
+        # cmd.exe -> claude.cmd -> interpreter chain that _install_fake_cli
+        # builds, which is where the bug lived.
+        async def scenario():
+            with _scratch() as tmp:
+                _install_fake_cli(
+                    tmp,
+                    "#!/usr/bin/env python3\n"
+                    "import json, sys\n"
+                    "sys.stdout.reconfigure(encoding='utf-8')\n"
+                    "print(json.dumps({'type': 'assistant', 'argv': sys.argv[1:]}))\n",
+                )
+                with mock.patch.dict(os.environ, {"PATH": tmp + os.pathsep + os.environ.get("PATH", "")}, clear=False):
+                    events = [
+                        event
+                        async for event in run_claude_stream(
+                            "hello & goodbye", workdir=tmp, system_hint="two words"
+                        )
+                    ]
+
+            argv = events[0]["argv"]
+            self.assertIn(f"--disallowedTools={runner.BLOCKED_TOOLS}", argv)
+            self.assertNotIn("-R", argv)
+            self.assertEqual(argv[argv.index("--append-system-prompt") + 1], "two words")
+            self.assertEqual(argv[-2:], ["--", "hello & goodbye"])
+
+        asyncio.run(scenario())
 
     def test_run_claude_stream_returns_json_and_error_event_on_nonzero_exit(self):
         async def scenario():
@@ -357,6 +393,10 @@ class RunnerTests(unittest.TestCase):
 
             env = dict(os.environ)
             env.pop("CLAUDE_STREAM_LIMIT_BYTES", None)
+            # An extensionless CLAUDE_BIN keeps the spawn on the exec path
+            # this fake intercepts; a machine with the npm `claude.cmd` on
+            # PATH would otherwise route it through create_subprocess_shell.
+            env["CLAUDE_BIN"] = "claude"
             with mock.patch.dict(os.environ, env, clear=True), mock.patch(
                 "src.runner.asyncio.create_subprocess_exec",
                 fake_create_subprocess_exec,
@@ -377,7 +417,9 @@ class RunnerTests(unittest.TestCase):
                 raise FileNotFoundError()
 
             with mock.patch.dict(
-                os.environ, {"CLAUDE_STREAM_LIMIT_BYTES": "1048576"}, clear=False
+                os.environ,
+                {"CLAUDE_STREAM_LIMIT_BYTES": "1048576", "CLAUDE_BIN": "claude"},
+                clear=False,
             ), mock.patch(
                 "src.runner.asyncio.create_subprocess_exec",
                 fake_create_subprocess_exec,
@@ -594,7 +636,7 @@ class RunnerTests(unittest.TestCase):
                 captured["argv"] = args
                 raise FileNotFoundError()
 
-            with mock.patch(
+            with mock.patch.dict(os.environ, {"CLAUDE_BIN": "claude"}, clear=False), mock.patch(
                 "src.runner.asyncio.create_subprocess_exec", fake_create_subprocess_exec
             ):
                 [event async for event in run_claude_stream("hello")]
@@ -804,7 +846,7 @@ class WarmRunnerTests(unittest.TestCase):
 
     def test_spawn_failure_in_warm_mode_still_reports_the_missing_cli(self):
         async def scenario():
-            with mock.patch(
+            with mock.patch.dict(os.environ, {"CLAUDE_BIN": "claude"}, clear=False), mock.patch(
                 "src.runner.asyncio.create_subprocess_exec",
                 mock.AsyncMock(side_effect=FileNotFoundError()),
             ):

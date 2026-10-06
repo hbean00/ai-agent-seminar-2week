@@ -185,8 +185,8 @@ def _kill_windows_process_tree(proc: asyncio.subprocess.Process) -> None:
 
     ``proc.terminate()`` calls TerminateProcess on the process we spawned and
     on nothing else. On Windows that process is usually ``cmd.exe``, because
-    the npm-installed CLI is ``claude.cmd`` and ``_wrap_windows_batch_command``
-    runs it through the shell -- so terminating it leaves the node process it
+    the npm-installed CLI is ``claude.cmd`` and ``_spawn_claude_process`` runs
+    it through the shell -- so terminating it leaves the node process it
     started alive, still holding the model session and the stdout pipe we stop
     reading from. ``taskkill /T`` walks the child tree instead.
 
@@ -378,16 +378,15 @@ def _resolve_stream_limit_bytes() -> int:
     return value if value > 0 else DEFAULT_STREAM_LIMIT_BYTES
 
 
-def _wrap_windows_batch_command(cmd: list[str]) -> list[str]:
+def _is_windows_batch_file(executable: str) -> bool:
+    """Whether the CLI is a ``.cmd``/``.bat`` shim that only cmd.exe can run.
+
+    npm installs the CLI as ``claude.cmd`` on Windows, and CreateProcess will
+    not start a batch file directly, so the spawn has to go through COMSPEC.
+    """
     if os.name != "nt":
-        return cmd
-
-    suffix = os.path.splitext(cmd[0])[1].lower()
-    if suffix not in WINDOWS_BATCH_EXTENSIONS:
-        return cmd
-
-    command_line = subprocess.list2cmdline(cmd)
-    return [os.environ.get("COMSPEC", "cmd.exe"), "/d", "/s", "/c", command_line]
+        return False
+    return os.path.splitext(executable)[1].lower() in WINDOWS_BATCH_EXTENSIONS
 
 BLOCKED_TOOLS = ",".join(
     [
@@ -445,7 +444,7 @@ def build_claude_command(
         cmd += ["--append-system-prompt", system_hint]
     if not stream_input:
         cmd += ["--", prompt]
-    return _wrap_windows_batch_command(cmd)
+    return cmd
 
 
 async def _spawn_claude_process(
@@ -457,28 +456,46 @@ async def _spawn_claude_process(
     extra_dirs: Iterable[str] | None,
     stream_input: bool,
 ) -> asyncio.subprocess.Process:
-    subprocess_kwargs = {}
-    if os.name != "nt":
-        subprocess_kwargs["start_new_session"] = True
-
-    return await asyncio.create_subprocess_exec(
-        *build_claude_command(
-            prompt,
-            resume=resume,
-            system_hint=system_hint,
-            extra_dirs=extra_dirs,
-            stream_input=stream_input,
-        ),
-        cwd=workdir,
+    cmd = build_claude_command(
+        prompt,
+        resume=resume,
+        system_hint=system_hint,
+        extra_dirs=extra_dirs,
+        stream_input=stream_input,
+    )
+    subprocess_kwargs = {
+        "cwd": workdir,
         # The cold path MUST keep stdin=DEVNULL: with stdin left open the CLI
         # waits an extra 3s and warns "no stdin data received in 3s" (issue #1).
         # The warm path keeps a pipe on purpose -- that pipe *is* the mechanism.
-        stdin=asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-        limit=_resolve_stream_limit_bytes(),
-        **subprocess_kwargs,
-    )
+        "stdin": asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,
+        "stdout": asyncio.subprocess.PIPE,
+        "stderr": asyncio.subprocess.PIPE,
+        "limit": _resolve_stream_limit_bytes(),
+    }
+    if os.name != "nt":
+        subprocess_kwargs["start_new_session"] = True
+
+    if _is_windows_batch_file(cmd[0]):
+        # A batch shim has to run under cmd.exe, and that cannot be expressed
+        # as an argv list. Passing [COMSPEC, "/c", line] to
+        # create_subprocess_exec re-quotes `line` with list2cmdline, which
+        # escapes every embedded quote as \" -- an escape cmd.exe does not
+        # know. The batch file forwards them verbatim through %*, the child's
+        # CRT reads \" as a literal quote, and every quoted argument splits at
+        # its spaces: --disallowedTools=...Bash(chmod -R 777:*)... arrived as
+        # three arguments and the CLI refused every Windows job with
+        # "error: unknown option '-R'".
+        #
+        # create_subprocess_shell hands the line to `cmd.exe /c "<line>"`
+        # untouched; cmd strips only that outer pair, so the quotes
+        # list2cmdline put around each spaced argument reach the shim intact.
+        return await asyncio.create_subprocess_shell(
+            subprocess.list2cmdline(cmd),
+            **subprocess_kwargs,
+        )
+
+    return await asyncio.create_subprocess_exec(*cmd, **subprocess_kwargs)
 
 
 def _warm_key(
