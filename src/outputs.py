@@ -1,5 +1,4 @@
 import asyncio
-import io
 import json
 import logging
 import os
@@ -10,12 +9,15 @@ from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
-import discord
-
+from src.chat import ChatChannel, ChatFile
 from src.errors import redact_paths
 
 logger = logging.getLogger(__name__)
 
+# Slack's own per-file ceiling is 1GB, far above anything this bot produces.
+# The cap stays where Discord's limit put it because the real constraint is
+# at the other end: an attachment this size is a job that went wrong, and
+# saying so beats uploading it.
 MAX_ATTACH_BYTES = 24 * 1024 * 1024
 SVG_PREVIEW_SIZE = 1400
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp", ".avif"}
@@ -26,15 +28,17 @@ SVG_FENCE_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
-# Discord's hard per-message character cap. DISCORD_CHUNK_LIMIT (below) stays
-# under this with headroom rather than filling it exactly — see _chunk.
-DISCORD_MESSAGE_LIMIT = 2000
-# Headroom below DISCORD_MESSAGE_LIMIT for the closing/reopening fence line
-# _chunk may need to inject at a chunk boundary, and for length-counting
-# mismatches (e.g. astral-plane emoji count as 2 UTF-16 units to Discord but
-# 1 Python codepoint here). Deliberately not "2000 exactly" (see the
-# perf handoff's Rejected section).
-DISCORD_CHUNK_LIMIT = 1950
+# Slack accepts up to 40000 characters of chat.postMessage text, but folds
+# anything past roughly 4000 behind a "show more" the reader has to click,
+# which defeats the point of posting the body inline at all. CHUNK_LIMIT
+# (below) stays under this with headroom rather than filling it exactly —
+# see _chunk.
+MESSAGE_LIMIT = 4000
+# Headroom below MESSAGE_LIMIT for the closing/reopening fence line _chunk
+# may need to inject at a chunk boundary, and for length-counting mismatches
+# between Python codepoints and what the receiving end counts. Deliberately
+# not "4000 exactly" (see the perf handoff's Rejected section).
+CHUNK_LIMIT = 3900
 
 _FENCE_LINE_RE = re.compile(r"^[ \t]{0,3}(`{3,}|~{3,})[^\n]*$")
 
@@ -46,24 +50,24 @@ _PREVIEW_SUFFIX = "\n\n… (본문이 길어 `response.md` 파일로 전체를 �
 
 
 async def send_outputs(
-    channel: discord.abc.Messageable,
+    channel: ChatChannel,
     job_dir: Path,
     *,
     body_text: str | None = None,
     warn_missing_manifest: bool = True,
 ):
-    """Send a job's answer body and attachments to a Discord channel.
+    """Send a job's answer body and attachments to a Slack channel.
 
     Body precedence (contract v2): ``output.md`` wins when it exists and is
     non-empty (long/structured answers, backward compatible); otherwise
     ``body_text`` — normally the model's final streamed text — is used. Both
-    go through the same inline-SVG extraction and ``DISCORD_CHUNK_LIMIT``
+    go through the same inline-SVG extraction and ``CHUNK_LIMIT``
     chunking, with code fences kept intact across chunk boundaries (see
     ``_chunk``).
 
     Pagination vs. attachment: sending each chunk as its own message queues
-    up against Discord's per-channel rate limit (5 sends / 5s) and tail-
-    latencies the rest of a long reply. If the body would take more than
+    up against Slack's roughly one-message-per-second-per-channel posting
+    limit and tail-latencies the rest of a long reply. If the body would take more than
     ``OUTPUT_INLINE_MAX_CHUNKS`` (default 3, env-overridable) chunks, it is
     not paginated — instead the whole body is sent once as a single
     ``response.md`` attachment (one send, no rate-limit queueing) alongside
@@ -178,7 +182,7 @@ def _read_entries_from(path: Path) -> tuple[list[Any] | None, str | None]:
     except OSError:
         # An OSError's str carries the absolute filesystem path
         # ("[Errno 21] Is a directory: '/Users/.../runs/job-x/meta.json'"),
-        # which must not be published to a Discord channel. The user gets the
+        # which must not be published to a Slack channel. The user gets the
         # bare filename; the operator gets the detail in the log.
         logger.warning("Failed to read job bookkeeping file %s", path, exc_info=True)
         return None, f"{path.name}을 읽을 수 없습니다."
@@ -234,7 +238,7 @@ async def _resolve_manifest_entries(job_dir: Path) -> tuple[list[Any], str | Non
 
 
 async def _maybe_send_empty_notice(
-    channel: discord.abc.Messageable,
+    channel: ChatChannel,
     body_source: str | None,
     sent_file_count: int,
     warn_missing_manifest: bool,
@@ -275,7 +279,7 @@ def _looks_like_svg(text: str) -> bool:
     return stripped.startswith("<svg") or (stripped.startswith("<?xml") and "<svg" in stripped[:500])
 
 
-async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Path, entries: list[Any]) -> int:
+async def _send_attachment_entries(channel: ChatChannel, job_dir: Path, entries: list[Any]) -> int:
     """Send attachments described by ``entries``. Returns the count of files
     actually transmitted (as opposed to merely listed) — used by
     ``_maybe_send_empty_notice`` to tell a real empty result from one where
@@ -293,7 +297,7 @@ async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Pa
         if p is None:
             # entry.get("path") is job-controlled text and, for an absolute
             # or traversal attempt, may itself be a real local path (#26) --
-            # redact before it reaches Discord.
+            # redact before it reaches Slack.
             await channel.send(f"manifest 경로를 무시했습니다: {redact_paths(str(entry.get('path')))}")
             continue
         if not p.exists():
@@ -316,10 +320,12 @@ async def _send_attachment_entries(channel: discord.abc.Messageable, job_dir: Pa
                 )
                 continue
 
-            # discord.File(path) opens the file synchronously in its
-            # constructor — blocking disk I/O — so it runs off the event
-            # loop thread.
-            file = await asyncio.to_thread(discord.File, attach_path, filename=attach_path.name)
+            # ChatFile holds a path, not an open handle: nothing is read
+            # here, so there is no blocking disk I/O to push off the loop
+            # and no descriptor left open if the upload never happens.
+            # chat.py reads the bytes inside asyncio.to_thread instead,
+            # at the moment it uploads them.
+            file = ChatFile(attach_path.name, path=attach_path)
             files.append(file)
             sent_count += 1
             if len(files) >= 10:
@@ -412,7 +418,7 @@ def _run_inkscape(svg_path: Path, preview_path: Path) -> bool:
 def _run_cairosvg(svg_path: Path, preview_path: Path) -> bool:
     """Pure-Python last resort for hosts with no rendering CLI on PATH at
     all. Imported lazily and optionally — cairosvg must not become a hard
-    runtime dependency just to send Discord messages (#20)."""
+    runtime dependency just to send chat messages (#20)."""
     try:
         import cairosvg
     except Exception:
@@ -449,7 +455,7 @@ def _render_svg_preview(svg_path: Path) -> Path | None:
     _attachment_paths_for). Tries each candidate in _SVG_RENDERERS in turn
     and returns the first PNG produced.
     """
-    preview_dir = svg_path.parent / ".discord-previews"
+    preview_dir = svg_path.parent / ".previews"
     preview_dir.mkdir(parents=True, exist_ok=True)
     preview_path = preview_dir / f"{svg_path.name}.png"
     if preview_path.exists() and preview_path.stat().st_mtime >= svg_path.stat().st_mtime:
@@ -489,38 +495,38 @@ def _effective_inline_max_chunks() -> int:
     return value
 
 
-async def _send_body_text(channel: discord.abc.Messageable, text: str) -> None:
-    """Send the answer body, chunked to fit Discord's per-message limit.
+async def _send_body_text(channel: ChatChannel, text: str) -> None:
+    """Send the answer body, chunked to fit Slack's per-message limit.
 
-    Sending each chunk as its own message queues up against Discord's
-    per-channel rate limit (5 sends / 5s), tail-latencying the rest of a
-    long reply. If pagination would take more than
+    Sending each chunk as its own message queues up against Slack's
+    roughly one-message-per-second-per-channel posting limit,
+    tail-latencying the rest of a long reply. If pagination would take more than
     ``_effective_inline_max_chunks()`` messages, skip pagination entirely
     and ship the whole body as one ``response.md`` attachment (a single
     send, so it never queues) plus a short preview of the start of the
     answer.
     """
-    chunks = _chunk(text, DISCORD_CHUNK_LIMIT)
+    chunks = _chunk(text, CHUNK_LIMIT)
     if len(chunks) <= _effective_inline_max_chunks():
         for chunk in chunks:
             await channel.send(chunk)
         return
 
     preview = _build_preview(text)
-    file = discord.File(io.BytesIO(text.encode("utf-8")), filename="response.md")
+    file = ChatFile("response.md", data=text.encode("utf-8"))
     await channel.send(preview, files=[file])
 
 
 def _build_preview(text: str) -> str:
-    budget = max(DISCORD_CHUNK_LIMIT - len(_PREVIEW_SUFFIX), 200)
+    budget = max(CHUNK_LIMIT - len(_PREVIEW_SUFFIX), 200)
     chunks = _chunk(text, budget)
     head = chunks[0] if chunks else ""
     return head.rstrip() + _PREVIEW_SUFFIX
 
 
-def _chunk(text: str, limit: int = DISCORD_CHUNK_LIMIT) -> list[str]:
+def _chunk(text: str, limit: int = CHUNK_LIMIT) -> list[str]:
     """Split ``text`` into pieces of at most ``limit`` characters, safe to
-    send as separate Discord messages.
+    send as separate Slack messages.
 
     - Operates on ``str`` (Unicode codepoints), not bytes, so a chunk
       boundary never lands in the middle of a multi-byte/multi-codeunit

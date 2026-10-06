@@ -20,12 +20,8 @@ class FakeChannel:
 
     async def send(self, content=None, *, files=None):
         files = files or []
-        # Snapshot each file's bytes before closing so tests can assert on
-        # attachment content (e.g. the full body shipped as response.md).
-        file_bytes = [file.fp.read() for file in files]
+        file_bytes = [file.read_bytes() for file in files]
         self.sent.append({"content": content, "files": files, "file_bytes": file_bytes})
-        for file in files:
-            file.close()
 
 
 class OutputTests(unittest.TestCase):
@@ -599,7 +595,7 @@ class OutputTests(unittest.TestCase):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 job_dir = Path(tmp)
-                # Long enough that pagination at DISCORD_CHUNK_LIMIT would
+                # Long enough that pagination at CHUNK_LIMIT would
                 # take well over OUTPUT_INLINE_MAX_CHUNKS (default 3).
                 long_text = "안녕하세요, 성능 개선 테스트입니다. " * 2000
                 channel = FakeChannel()
@@ -621,7 +617,7 @@ class OutputTests(unittest.TestCase):
 
         self.assertIsNotNone(message["content"])
         self.assertLess(len(message["content"]), len(long_text))
-        self.assertLessEqual(len(message["content"]), outputs.DISCORD_CHUNK_LIMIT)
+        self.assertLessEqual(len(message["content"]), outputs.CHUNK_LIMIT)
         self.assertIn("response.md", message["content"])
 
     def test_send_outputs_still_paginates_inline_within_chunk_budget(self):
@@ -630,7 +626,11 @@ class OutputTests(unittest.TestCase):
                 job_dir = Path(tmp)
                 # Two chunks' worth of body — within OUTPUT_INLINE_MAX_CHUNKS
                 # (default 3) — must still be sent inline, not attached.
-                short_text = "가나다라마바사아자차. " * 250
+                # Sized from the constant, not a literal: a body tuned to one
+                # limit quietly collapses to a single chunk when the limit
+                # moves, and the test then asserts nothing.
+                unit = "가나다라마바사아자차. "
+                short_text = unit * (int(outputs.CHUNK_LIMIT * 1.5) // len(unit))
                 channel = FakeChannel()
                 await send_outputs(channel, job_dir, body_text=short_text)
                 return channel.sent, short_text
@@ -647,7 +647,8 @@ class OutputTests(unittest.TestCase):
         async def scenario():
             with tempfile.TemporaryDirectory() as tmp:
                 job_dir = Path(tmp)
-                short_text = "가나다라마바사아자차. " * 250
+                unit = "가나다라마바사아자차. "
+                short_text = unit * (int(outputs.CHUNK_LIMIT * 1.5) // len(unit))
                 channel = FakeChannel()
                 with mock.patch.dict(os.environ, {"OUTPUT_INLINE_MAX_CHUNKS": "1"}):
                     await send_outputs(channel, job_dir, body_text=short_text)
@@ -725,7 +726,7 @@ class SvgRendererFallbackTests(unittest.TestCase):
                     mock.patch("src.outputs.subprocess.run", fake_run):
                 result = outputs._render_svg_preview(svg_path)
 
-            self.assertEqual(result, job_dir / ".discord-previews" / "art.svg.png")
+            self.assertEqual(result, job_dir / ".previews" / "art.svg.png")
             # qlmanage was probed (and skipped, not installed); inkscape and
             # cairosvg were never even probed once rsvg-convert succeeded.
             self.assertEqual(which_calls, ["qlmanage", "rsvg-convert"])
@@ -754,7 +755,7 @@ class SvgRendererFallbackTests(unittest.TestCase):
                     mock.patch.dict("sys.modules", {"cairosvg": fake_cairosvg}):
                 result = outputs._render_svg_preview(svg_path)
 
-            self.assertEqual(result, job_dir / ".discord-previews" / "art.svg.png")
+            self.assertEqual(result, job_dir / ".previews" / "art.svg.png")
             self.assertEqual(len(calls), 1)
 
     def test_returns_none_and_logs_when_no_renderer_is_available(self):
