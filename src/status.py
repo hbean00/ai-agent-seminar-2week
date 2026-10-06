@@ -5,7 +5,9 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-import discord
+from slack_sdk.errors import SlackClientError
+
+from src.chat import ChatFile, SentMessage
 
 logger = logging.getLogger(__name__)
 
@@ -14,18 +16,19 @@ QUEUED_MESSAGE = "대기 중"
 WORKING_GIF_PATH = Path(__file__).resolve().parents[1] / "working_m.gif"
 WORKING_GIF_FILENAME = "working_m.gif"
 
-# Uploading working_m.gif (192KB) on every ack delayed the very first Discord
+# Uploading working_m.gif (192KB) on every ack delayed the very first chat
 # response. The GIF is now opt-in only, via WORKING_GIF=1/true; the default
 # ack is text-only and goes out immediately.
 WORKING_GIF_ENV_VAR = "WORKING_GIF"
 WORKING_GIF_TRUTHY_VALUES = {"1", "true", "yes", "on"}
 
-# Discord's message-edit route allows ~5 edits per 5 seconds before an
-# edit queues behind the rate-limit bucket (risking the final "완료" edit
-# arriving late). 2.5s keeps us at 0.4 edits/sec, well under that 1/sec
-# ceiling.
+# chat.update is a Tier 3 Web API method: roughly 50 calls a minute per
+# workspace before Slack starts returning ratelimited and the final "완료"
+# edit risks arriving late. 2.5s keeps us at 0.4 edits/sec, half of that
+# ceiling -- and the budget is per workspace, not per channel, so two jobs
+# running at once share it.
 EDIT_INTERVAL_SECONDS = 2.5
-DISCORD_EDIT_RATE_LIMIT_PER_SECOND = 1.0  # 5 edits / 5 seconds
+SLACK_EDIT_RATE_LIMIT_PER_SECOND = 50 / 60  # Tier 3: 50+ requests per minute
 
 # Issue #19: a *fixed* interval makes the edit count grow linearly with job
 # duration, and 5-10 minute Claude Code jobs are normal here -- at a flat 2.5s
@@ -62,12 +65,12 @@ def _working_gif_enabled() -> bool:
     return raw.strip().lower() in WORKING_GIF_TRUTHY_VALUES
 
 
-def make_working_gif_file() -> discord.File | None:
+def make_working_gif_file() -> ChatFile | None:
     if not _working_gif_enabled():
         return None
     if not WORKING_GIF_PATH.is_file():
         return None
-    return discord.File(WORKING_GIF_PATH, filename=WORKING_GIF_FILENAME)
+    return ChatFile(WORKING_GIF_FILENAME, path=WORKING_GIF_PATH)
 
 
 @dataclass
@@ -174,7 +177,7 @@ def format_queued_status(job_name: str, ahead: int) -> str:
 
 
 async def run_spinning_loader(
-    message: discord.Message,
+    message: SentMessage,
     job_name: str,
     progress: "JobProgress | None" = None,
     *,
@@ -191,12 +194,13 @@ async def run_spinning_loader(
         delay = min(delay * growth, max_interval)
         try:
             await message.edit(content=format_working_status(job_name, progress))
-        except (discord.DiscordException, OSError):
-            # Message gone / permissions changed (DiscordException), or a
-            # transient network hiccup such as aiohttp.ClientOSError (an
-            # OSError subclass). The loader is best-effort UI, so bail out
-            # quietly rather than dying with an exception that would
-            # otherwise surface when the caller awaits this task.
+        except (SlackClientError, OSError):
+            # Message gone / token scope changed / ratelimited
+            # (SlackClientError, the parent of SlackApiError), or a transient
+            # network hiccup such as aiohttp.ClientOSError (an OSError
+            # subclass). The loader is best-effort UI, so bail out quietly
+            # rather than dying with an exception that would otherwise
+            # surface when the caller awaits this task.
             logger.warning("run_spinning_loader: edit failed, stopping loader", exc_info=True)
             return
 

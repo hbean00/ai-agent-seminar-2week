@@ -7,7 +7,7 @@ from itertools import pairwise
 from pathlib import Path
 from unittest import mock
 
-import discord
+from slack_sdk.errors import SlackApiError
 
 from src import status
 from src.status import (
@@ -27,7 +27,7 @@ from src.status import (
 
 
 class FakeMessage:
-    """Fake discord.Message-like target for run_spinning_loader.
+    """Fake SentMessage-like target for run_spinning_loader.
 
     If constructed with a `progress`, it mutates that progress object after
     the first recorded edit, so tests can deterministically assert that a
@@ -152,14 +152,14 @@ class StatusTests(unittest.TestCase):
         self.assertEqual(progress.turn, 2)
         self.assertIsNone(progress.tool)
 
-    def test_edit_interval_meets_discord_rate_limit_safety_margin(self):
+    def test_edit_interval_meets_slack_rate_limit_safety_margin(self):
         # Design-time guard for the configured constant. Real emission
         # timing against this exact constant is verified below by actually
         # driving run_spinning_loader and observing asyncio.sleep/edit calls
         # -- not by inspecting a default parameter that is never invoked.
         self.assertGreaterEqual(EDIT_INTERVAL_SECONDS, 2.5)
         implied_edits_per_second = 1 / EDIT_INTERVAL_SECONDS
-        self.assertLess(implied_edits_per_second, status.DISCORD_EDIT_RATE_LIMIT_PER_SECOND)
+        self.assertLess(implied_edits_per_second, status.SLACK_EDIT_RATE_LIMIT_PER_SECOND)
 
     def test_run_spinning_loader_sleeps_for_edit_interval_seconds_when_uncalled_with_override(self):
         # Exercises the exact call main.py makes (no `interval=` override)
@@ -305,7 +305,7 @@ class StatusTests(unittest.TestCase):
 
             self.assertIsNotNone(file)
             self.assertEqual(file.filename, WORKING_GIF_FILENAME)
-            file.close()
+            self.assertEqual(file.path, gif_path)
 
     def test_make_working_gif_file_accepts_true_string_case_insensitively(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -319,7 +319,6 @@ class StatusTests(unittest.TestCase):
                 file = make_working_gif_file()
 
             self.assertIsNotNone(file)
-            file.close()
 
     def test_make_working_gif_file_treats_falsey_string_as_disabled(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -411,13 +410,14 @@ class SpinnerBackoffTests(unittest.TestCase):
 
 
 class SpinnerFailureLoggingTests(unittest.TestCase):
-    def test_a_loader_killed_by_discord_says_so_in_the_log(self):
-        # Issue #19/#25: the loop used to swallow DiscordException and stop,
-        # so a rate-limited spinner froze the status line with no trace of why.
+    def test_a_loader_killed_by_slack_says_so_in_the_log(self):
+        # Issue #19/#25: the loop used to swallow the transport error and
+        # stop, so a rate-limited spinner froze the status line with no
+        # trace of why.
         async def scenario():
             class DeadMessage:
                 async def edit(self, *, content=None):
-                    raise discord.DiscordException("rate limited")
+                    raise SlackApiError("ratelimited", response={"ok": False})
 
             task = asyncio.create_task(
                 run_spinning_loader(DeadMessage(), "job-123", interval=0)
@@ -435,7 +435,7 @@ class SpinnerFailureLoggingTests(unittest.TestCase):
         self.assertTrue(any("stopping loader" in line for line in captured.output))
         # exc_info=True: the reason the spinner died is in the log too, which
         # is the whole point -- a frozen status line is otherwise unexplained.
-        self.assertTrue(any("DiscordException" in line for line in captured.output))
+        self.assertTrue(any("SlackApiError" in line for line in captured.output))
 
 
 class QueuedStatusTests(unittest.TestCase):
