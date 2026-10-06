@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "discord-claude-assistant"
+    [string]$TaskName = "slack-claude-assistant"
 )
 
 $ErrorActionPreference = "Stop"

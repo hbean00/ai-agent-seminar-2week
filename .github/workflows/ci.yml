@@ -34,9 +34,9 @@ jobs:
         with:
           enable-cache: true
       # 3.11 is the floor declared in pyproject; 3.13 catches deprecations
-      # early (discord.py still imports the removed-in-3.13 audioop).
+      # early.
       - run: uv sync --group dev --python ${{ matrix.python-version }}
-      # No env vars here on purpose: needing OWNER_DISCORD_ID to *collect*
+      # No env vars here on purpose: needing OWNER_SLACK_ID to *collect*
       # tests was the bug in #9, so an unset environment is the regression test.
       - run: uv run --no-sync pytest -q
 

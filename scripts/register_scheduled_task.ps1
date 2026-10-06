@@ -1,5 +1,5 @@
 param(
-    [string]$TaskName = "discord-claude-assistant"
+    [string]$TaskName = "slack-claude-assistant"
 )
 
 $ErrorActionPreference = "Stop"
@@ -11,7 +11,7 @@ if (-not (Test-Path $PythonBin)) {
     throw "가상환경을 먼저 준비하세요: scripts\setup.ps1"
 }
 
-$LogDir = Join-Path $env:LOCALAPPDATA "discord-claude-assistant\logs"
+$LogDir = Join-Path $env:LOCALAPPDATA "slack-claude-assistant\logs"
 New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
 $LogPath = Join-Path $LogDir "bot.log"
 
@@ -40,7 +40,7 @@ Register-ScheduledTask `
     -Action $Action `
     -Trigger $Trigger `
     -Settings $Settings `
-    -Description "Run discord-claude-assistant at user logon." `
+    -Description "Run slack-claude-assistant at user logon." `
     -Force | Out-Null
 
 Start-ScheduledTask -TaskName $TaskName

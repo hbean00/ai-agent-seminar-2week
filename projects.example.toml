@@ -4,7 +4,7 @@
 # PROJECTS_FILE to point anywhere else, then edit the entries for your own
 # projects. If no file is present, the bot runs fine with no project tags.
 #
-# Each top-level table name becomes a "@name" tag in Discord messages.
+# Each top-level table name becomes a "@name" tag in Slack messages.
 #   dir  (required) - directory name (or absolute path) for the project.
 #                      A relative name is resolved under PROJECT_ROOT; an
 #                      absolute path is used as-is, bypassing PROJECT_ROOT.
