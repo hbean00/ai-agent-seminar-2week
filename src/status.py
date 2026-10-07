@@ -154,8 +154,11 @@ def _activity_label(progress: "JobProgress | None") -> str:
 
 def format_working_status(job_name: str, progress: "JobProgress | None" = None) -> str:
     elapsed = progress.elapsed_seconds() if progress else 0.0
+    # Single asterisks: Slack renders mrkdwn, where `**bold**` is not bold at
+    # all but a literal pair of stars around the word. This is the first thing
+    # the user sees on every job, so it showed "**작업중입니다.**" verbatim.
     return (
-        f"⚙️ **{WORKING_MESSAGE}**\n"
+        f"⚙️ *{WORKING_MESSAGE}*\n"
         f"{_activity_label(progress)} · 경과 {_format_elapsed(elapsed)}\n"
         f"`{job_name}`"
     )
@@ -170,7 +173,7 @@ def format_queued_status(job_name: str, ahead: int) -> str:
     for a slot when this one arrived.
     """
     return (
-        f"⏳ **{QUEUED_MESSAGE} (앞에 {max(0, ahead)}건)**\n"
+        f"⏳ *{QUEUED_MESSAGE} (앞에 {max(0, ahead)}건)*\n"
         f"앞선 작업이 끝나면 바로 시작합니다\n"
         f"`{job_name}`"
     )

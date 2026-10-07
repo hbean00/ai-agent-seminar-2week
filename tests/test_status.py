@@ -82,7 +82,8 @@ class StatusTests(unittest.TestCase):
         status_text = format_working_status("job-123")
 
         self.assertEqual(WORKING_MESSAGE, "작업중입니다.")
-        self.assertIn(f"**{WORKING_MESSAGE}**", status_text)
+        # Single asterisk: Slack mrkdwn, not Markdown (see SlackFormattingTests).
+        self.assertIn(f"*{WORKING_MESSAGE}*", status_text)
         self.assertIn("경과 00:00", status_text)
         self.assertIn("`job-123`", status_text)
         self.assertGreaterEqual(status_text.count("\n"), 2)
@@ -438,12 +439,35 @@ class SpinnerFailureLoggingTests(unittest.TestCase):
         self.assertTrue(any("SlackApiError" in line for line in captured.output))
 
 
+class SlackFormattingTests(unittest.TestCase):
+    """Slack renders mrkdwn, not Markdown.
+
+    `**bold**` is Markdown; Slack's mrkdwn uses a single `*bold*` and shows the
+    doubled form as literal asterisks. The ack is the first thing a user sees
+    on every single job, so it read "**작업중입니다.**" with the stars visible.
+    """
+
+    def test_working_status_uses_single_asterisk_bold(self):
+        text = format_working_status("job-123")
+        self.assertIn(f"*{WORKING_MESSAGE}*", text)
+        self.assertNotIn("**", text)
+
+    def test_queued_status_uses_single_asterisk_bold(self):
+        text = format_queued_status("job-123", 2)
+        self.assertNotIn("**", text)
+        self.assertIn(QUEUED_MESSAGE, text)
+
+    def test_the_job_name_stays_in_backticks(self):
+        # Backtick code spans mean the same thing in both, so they stay.
+        self.assertIn("`job-123`", format_working_status("job-123"))
+
+
 class QueuedStatusTests(unittest.TestCase):
     def test_format_queued_status_states_the_queue_position_and_job_name(self):
         text = format_queued_status("job-abc123", 2)
 
         self.assertEqual(QUEUED_MESSAGE, "대기 중")
-        self.assertIn(f"**{QUEUED_MESSAGE} (앞에 2건)**", text)
+        self.assertIn(f"*{QUEUED_MESSAGE} (앞에 2건)*", text)
         self.assertIn("`job-abc123`", text)
         # It must not read as a running job -- that is the whole point of
         # issue #6's distinct queued ack.
