@@ -223,15 +223,31 @@ class DetectorTests(unittest.TestCase):
 
 
 class CommandParsingTests(unittest.TestCase):
-    def test_list_command_variants(self):
-        for text in ("예약 목록", "예약목록", "  예약 리스트  "):
+    def test_list_command_accepts_how_people_actually_type_it(self):
+        # The first version matched "예약 목록" exactly, so "예약 목록 보여줘"
+        # fell through to an ordinary job and the bot went searching Google
+        # Calendar for the word 예약. Nobody types bare commands.
+        for text in (
+            "예약 목록",
+            "예약목록",
+            "  예약 리스트  ",
+            "예약 목록 보여줘",
+            "예약목록 알려줘",
+            "예약 현황 보여줘",
+            "등록된 예약 목록 알려줘",
+        ):
             with self.subTest(text=text):
                 self.assertTrue(schedules.parse_list_command(text))
-        self.assertFalse(schedules.parse_list_command("예약 목록 보여줘"))
+
+    def test_list_command_does_not_swallow_unrelated_messages(self):
+        for text in ("뉴스 요약해줘", "예약하고 싶어", "목록 보여줘", "식당 예약했어"):
+            with self.subTest(text=text):
+                self.assertFalse(schedules.parse_list_command(text))
 
     def test_delete_command_returns_the_id(self):
         self.assertEqual(schedules.parse_delete_command("예약 삭제 a1b2c3d4"), "a1b2c3d4")
         self.assertEqual(schedules.parse_delete_command("예약 취소 a1b2c3d4"), "a1b2c3d4")
+        self.assertEqual(schedules.parse_delete_command("예약 삭제 a1b2c3d4 해줘"), "a1b2c3d4")
         self.assertIsNone(schedules.parse_delete_command("예약 삭제"))
         self.assertIsNone(schedules.parse_delete_command("예약 삭제 전부"))
 

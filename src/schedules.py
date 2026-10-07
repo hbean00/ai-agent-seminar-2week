@@ -313,8 +313,12 @@ _SCHEDULE_HINT_RE = re.compile(
     r"매일|매주|매 ?주|평일|주말|날마다|아침마다|저녁마다|밤마다|정기적으로|예약해|예약 ?등록"
 )
 
-LIST_COMMANDS = ("예약 목록", "예약목록", "예약 리스트")
-_DELETE_RE = re.compile(r"^예약\s*(?:삭제|취소|해제)\s+([0-9a-f]{4,32})$")
+# "예약 목록"만 정확히 일치시키면 "예약 목록 보여줘"가 일반 작업으로 새어
+# 나간다 -- 실제로 그렇게 샜고, 봇이 구글 캘린더에서 "예약"을 검색했다.
+# 사람은 명령어를 외워 치지 않고 말끝을 붙인다. 꼬리말은 흘려보내되, 여전히
+# 정규식 한 번이라 CLI 호출 비용은 0이다.
+_LIST_RE = re.compile(r"^(?:등록(?:된)?\s*)?예약\s*(?:목록|리스트|현황)\b")
+_DELETE_RE = re.compile(r"^예약\s*(?:삭제|취소|해제)\s+([0-9a-f]{4,32})\b")
 
 EXTRACTION_SYSTEM_HINT = (
     "너는 한국어 요청에서 반복 일정을 추출하는 파서다. "
@@ -357,7 +361,7 @@ def looks_like_schedule_request(text: str) -> bool:
 
 
 def parse_list_command(text: str) -> bool:
-    return text.strip() in LIST_COMMANDS
+    return bool(_LIST_RE.match(text.strip()))
 
 
 def parse_delete_command(text: str) -> str | None:
