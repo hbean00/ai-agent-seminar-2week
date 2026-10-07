@@ -4,6 +4,7 @@ from unittest import mock
 import pytest
 
 import src.parser as parser_module
+from src import capabilities
 from src.parser import parse
 
 
@@ -192,3 +193,44 @@ def test_non_utf8_toml_does_not_crash(tmp_path, monkeypatch, caplog):
     assert cmd.workdir is None
     assert cmd.prompt == "@book 확인해줘"
     assert any("projects file" in record.message for record in caplog.records)
+
+
+def test_a_capability_tag_injects_its_directive_and_strips_the_tag(tmp_path, monkeypatch):
+    # The capability text has to ride the *prompt*, not system_hint: sent as a
+    # system prompt the model read it as background and answered "그런 기능이
+    # 없습니다" without calling Bash once.
+    (tmp_path / "lms.md").write_text("공지 조회: python canvas_api.py", encoding="utf-8")
+    monkeypatch.setattr(capabilities, "DEFAULT_CAPABILITIES_DIR", tmp_path)
+    capabilities._cache.clear()
+
+    cmd = parse("@lms 최근 공지 있어?")
+
+    assert "python canvas_api.py" in cmd.prompt
+    assert "최근 공지 있어?" in cmd.prompt
+    assert "@lms" not in cmd.prompt
+    assert cmd.system_hint is None
+
+
+def test_an_untagged_message_costs_no_extra_prompt(tmp_path, monkeypatch):
+    (tmp_path / "lms.md").write_text("공지 조회", encoding="utf-8")
+    monkeypatch.setattr(capabilities, "DEFAULT_CAPABILITIES_DIR", tmp_path)
+    capabilities._cache.clear()
+
+    assert parse("최근 공지 있어?").prompt == "최근 공지 있어?"
+
+
+def test_a_project_tag_wins_over_a_capability_of_the_same_name(tmp_path, monkeypatch):
+    # A project tag changes the working directory, which is the bigger
+    # decision; the capability must not shadow it.
+    (tmp_path / "book.md").write_text("기능 설명", encoding="utf-8")
+    monkeypatch.setattr(capabilities, "DEFAULT_CAPABILITIES_DIR", tmp_path)
+    capabilities._cache.clear()
+
+    config = tmp_path / "projects.toml"
+    config.write_text('[book]\ndir = "book"\nhint = "프로젝트 힌트"\n', encoding="utf-8")
+    monkeypatch.setenv("PROJECTS_FILE", str(config))
+
+    cmd = parse("@book 원고 고쳐줘")
+
+    assert cmd.system_hint == "프로젝트 힌트"
+    assert "기능 설명" not in cmd.prompt

@@ -4,6 +4,8 @@ import tomllib
 from dataclasses import dataclass
 from pathlib import Path
 
+from src import capabilities
+
 logger = logging.getLogger(__name__)
 
 # Repo root, two levels up from this file (src/parser.py -> repo root).
@@ -121,5 +123,14 @@ def parse(text: str) -> Command:
                 workdir=workdir,
                 system_hint=hint,
             )
+
+    # 프로젝트 태그 다음에 본다. 이름이 겹치면 프로젝트가 이기는데, 프로젝트는
+    # 작업 디렉터리를 바꾸는 더 큰 결정이기 때문이다.
+    #
+    # 기능 설명은 system_hint가 아니라 prompt 앞에 붙는다. 시스템 프롬프트로
+    # 보냈을 때 모델이 그대로 무시했기 때문이다 -- capabilities.py 설명 참고.
+    directive, rest = capabilities.resolve(text)
+    if directive is not None:
+        return Command(prompt=f"{directive}\n\n---\n\n{rest}")
 
     return Command(prompt=text)
