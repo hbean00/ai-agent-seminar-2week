@@ -361,13 +361,20 @@ async def _handle_schedule_commands(msg, text: str) -> bool:
     return False
 
 
-async def _extract_schedule(text: str) -> schedules.ScheduleSpec | None:
+async def _extract_schedule(text: str) -> tuple[schedules.ScheduleSpec | None, str | None]:
     """Ask the CLI to read a recurring schedule out of ``text``.
 
+    Returns ``(spec, failure)``. ``spec`` is None whenever no schedule was
+    registered; ``failure`` separates *why*, because the two reasons need
+    different words. A verdict of "not a schedule" is the model answering the
+    question, and the turn simply continues as an ordinary job. A failure is
+    the question never getting answered -- a dead CLI, a rate limit -- and
+    saying "해석하지 못해" there reads as "your sentence was not understood",
+    which sent the first user who hit it off to reword a message that was
+    fine. The failure text is carried back so the ack can name the real cause.
+
     Reached only for messages the cheap filter flagged, so an ordinary job
-    never pays for this. Any failure -- a dead CLI, prose instead of JSON, a
-    message that merely mentioned 매일 -- returns None and the caller runs the
-    message as the normal job it probably always was.
+    never pays for this.
     """
     collected = []
     try:
@@ -378,13 +385,15 @@ async def _extract_schedule(text: str) -> schedules.ScheduleSpec | None:
             if event.get("type") == "result":
                 collected.append(str(event.get("result") or ""))
             elif event.get("type") == "error":
-                logger.warning("schedule extraction failed: %s", event.get("text"))
-                return None
-    except Exception:
+                detail = str(event.get("text") or "")
+                logger.warning("schedule extraction failed: %s", detail)
+                # #26: CLI error text routinely carries absolute paths.
+                return None, redact_paths(detail)
+    except Exception as exc:
         logger.exception("schedule extraction raised")
-        return None
+        return None, safe_error_text(exc)
 
-    return schedules.parse_extraction("\n".join(collected))
+    return schedules.parse_extraction("\n".join(collected)), None
 
 
 async def _try_register_schedule(msg, text: str) -> bool:
@@ -393,11 +402,15 @@ async def _try_register_schedule(msg, text: str) -> bool:
         return False
 
     notice = await msg.reply("예약 요청으로 보입니다. 시각을 해석하는 중...")
-    spec = await _extract_schedule(text)
+    spec, failure = await _extract_schedule(text)
     if spec is None:
-        # Not a schedule after all (or the parse failed): say so and fall
-        # through, so the message still runs as an ordinary job.
-        await _safe_edit_ack(notice, "예약으로 해석하지 못해 일반 작업으로 실행합니다.")
+        # Either way the turn continues as an ordinary job, but the two
+        # reasons get different words -- see _extract_schedule.
+        if failure:
+            note = f"예약 해석에 실패했습니다: {failure[:300]}\n일반 작업으로 실행합니다."
+        else:
+            note = "예약이 아니라고 판단했습니다. 일반 작업으로 실행합니다."
+        await _safe_edit_ack(notice, note)
         return False
 
     schedule = schedules.add_schedule(

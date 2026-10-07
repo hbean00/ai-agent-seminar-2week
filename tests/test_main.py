@@ -2306,6 +2306,55 @@ class ScheduleRegistrationTests(_ScheduleStoreTestCase):
         self.assertFalse(handled)
         self.assertEqual(schedules.list_schedules(), [])
 
+    def test_a_cli_failure_says_so_rather_than_blaming_the_wording(self):
+        # The first report of this: the CLI was rate-limited, the ack said
+        # "예약으로 해석하지 못해", and that reads as "your sentence was not
+        # understood" -- sending the user off to reword a message that was
+        # fine. The two outcomes have to be told apart.
+        ack = FakeAck()
+        msg = FakeMessage("", FakeChannel("C01"), ack)
+
+        async def limited_stream(*args, **kwargs):
+            yield {"type": "error", "text": "You've hit your session limit · resets 6:50am"}
+
+        with mock.patch.object(main, "run_claude_stream", limited_stream):
+            handled = asyncio.run(
+                main._try_register_schedule(msg, "매일 아침 9시에 일정 알려줘")
+            )
+
+        self.assertFalse(handled)
+        note = ack.edits[-1]
+        self.assertIn("실패", note)
+        # The actual reason reaches the user instead of being swallowed.
+        self.assertIn("session limit", note)
+
+    def test_a_not_a_schedule_verdict_does_not_claim_a_failure(self):
+        ack = FakeAck()
+        msg = FakeMessage("", FakeChannel("C01"), ack)
+
+        async def rejecting_stream(*args, **kwargs):
+            yield {"type": "result", "result": '{"is_schedule": false}'}
+
+        with mock.patch.object(main, "run_claude_stream", rejecting_stream):
+            handled = asyncio.run(main._try_register_schedule(msg, "매일 쓰는 스크립트 고쳐줘"))
+
+        self.assertFalse(handled)
+        note = ack.edits[-1]
+        self.assertNotIn("실패", note)
+
+    def test_the_failure_note_is_redacted(self):
+        # Issue #26: CLI error text routinely carries absolute paths.
+        ack = FakeAck()
+        msg = FakeMessage("", FakeChannel("C01"), ack)
+
+        async def pathy_stream(*args, **kwargs):
+            yield {"type": "error", "text": "cannot open /Users/someone/secret/notes.md"}
+
+        with mock.patch.object(main, "run_claude_stream", pathy_stream):
+            asyncio.run(main._try_register_schedule(msg, "매일 아침 뉴스 요약해줘"))
+
+        self.assertNotIn("/Users/someone/secret", ack.edits[-1])
+
     def test_a_dead_cli_does_not_strand_the_turn(self):
         msg = FakeMessage("", FakeChannel("C01"), FakeAck())
 
