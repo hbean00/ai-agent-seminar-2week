@@ -4,24 +4,25 @@
 # tests
 
 ## Purpose
-`src/` 각 모듈에 1:1로 대응하는 테스트 스위트. 총 449개 테스트(+ subtest 42개)가 있으며 pytest로 실행한다. Slack Web API나 Claude CLI 같은 외부 의존성은 전부 `unittest.mock` 또는 duck-typed 가짜 객체로 대체하므로 네트워크·서브프로세스 없이 돈다.
+`src/` 각 모듈에 1:1로 대응하는 테스트 스위트. 총 476개 테스트(+ subtest 50개)가 있으며 pytest로 실행한다. Slack Web API나 Claude CLI 같은 외부 의존성은 전부 `unittest.mock` 또는 duck-typed 가짜 객체로 대체하므로 네트워크·서브프로세스 없이 돈다.
 
 ## Key Files
 
 | File | Tests | Description |
 |------|-------|-------------|
 | `test_orchestrator.py` | 63 | 잡 디렉터리 생성, 이어하기 작업 디렉터리 해석, 오래된 잡 정리(`RUNS_RETENTION_DAYS`) |
-| `test_main.py` | 78 | 이벤트 핸들러 조립. 종료 명령 인식, 만료 세션 자동 복구, 잡 타임아웃, 동시 실행 게이트 |
+| `test_main.py` | 81 | 이벤트 핸들러 조립. 종료 명령 인식, 만료 세션 자동 복구, 잡 타임아웃, 동시 실행 게이트 |
 | `test_runner.py` | 45 | Claude CLI 명령줄 조립, 스트림 파싱, 웜/콜드 경로 분기, 프로세스 종료 요약 |
 | `test_outputs.py` | 40 | manifest 경로 탈출 방어, 인라인 SVG 추출, 첨부 분할, SVG 렌더러 폴백 |
 | `test_errors.py` | 38 | 경로 삭제(redaction). 홈/절대경로/Windows 경로 축약, URL 보존, 멱등성 |
-| `test_status.py` | 31 | 진행바 포맷팅, 대기열 문구, GIF 자산 존재/부재 처리 |
+| `test_status.py` | 34 | 진행바 포맷팅, 대기열 문구, GIF 자산 존재/부재 처리 |
 | `test_warm_pool.py` | 28 | 웜 프로세스 대여·반납, 유휴 TTL, 프로세스 상한, `retire` 콜백 위임 |
 | `test_sessions.py` | 27 | 세션 영속화, TTL 만료, 원자적 쓰기, 손상 저장소 격리, 레거시 포맷 흡수 |
 | `test_timing.py` | 22 | span 기록, 재시도 시 attempt 아카이빙, 기동 오버헤드 산출, `timings.json` 기록 |
-| `test_schedules.py` | 30 | 슬롯 계산, 따라잡기, 중복 실행 방지, 손상 저장소 격리, 자연어 선별기와 추출 파서 |
+| `test_schedules.py` | 31 | 슬롯 계산, 따라잡기, 중복 실행 방지, 손상 저장소 격리, 자연어 선별기와 추출 파서 |
 | `test_chat.py` | 17 | Slack 전송 래퍼. 스레드 라우팅, 텍스트와 업로드의 분리 전송, 편집 대상 식별 |
-| `test_parser.py` | 13 | `@sess-`·프로젝트 태그 파싱, `projects.toml` 로딩과 mtime 캐시 |
+| `test_capabilities.py` | 19 | 기능 등록, `@태그` 해석, 오타 태그 무시, 캐시 무효화, 길이 상한 |
+| `test_parser.py` | 16 | `@sess-`·프로젝트 태그 파싱, `projects.toml` 로딩과 mtime 캐시 |
 | `test_auth.py` | 14 | 소유자·채널 허용 목록, 다중 소유자, 지연 설정 로딩, Slack ID 형식 검증 |
 | `test_greetings.py` | 3 | 인사 즉답 정확 일치 |
 
@@ -37,7 +38,7 @@
 
 ### Testing Requirements
 ```bash
-uv run pytest -q          # 기대 결과: 447 passed, 2 skipped, 42 subtests passed
+uv run pytest -q          # 기대 결과: 474 passed, 2 skipped, 50 subtests passed
 ```
 `pytest`는 `[dependency-groups] dev`에 선언되어 있으므로 `uv run`이 알아서 끌어온다.
 
